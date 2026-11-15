@@ -18,6 +18,8 @@ concurrency:
 jobs:
   deploy:
     name: Publish docs/ to GitHub Pages
+    # GitHub Free only allows GitHub Pages on public repositories; skip cleanly while private.
+    if: github.event.repository.private == false || github.event_name == 'workflow_dispatch'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
