@@ -45,10 +45,7 @@ COPY tensormmu ./tensormmu
 COPY runtime ./runtime
 COPY decompiler ./decompiler
 COPY data ./data
-COPY eval ./eval
-COPY models ./models
 COPY docs ./docs
-COPY serve_nvm_openai.py ./
 
 RUN pip install --no-build-isolation --no-deps -e . \
     && mkdir -p /models/hf_cache /models/cartridges

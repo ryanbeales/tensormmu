@@ -25,6 +25,10 @@ Executes on a single `24 GB RTX 4090 + 34.3 GB System RAM` Windows 11 workstatio
 """
 
 from __future__ import annotations
+import os as _os, sys as _sys
+_REPO_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
 
 import argparse
 import gc

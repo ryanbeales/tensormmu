@@ -1,3 +1,7 @@
+import os as _os, sys as _sys
+_REPO_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
 """Phase D Scale-Out Proof: `google/gemma-4-31B-it` (`62.55 GB` BF16) on a Single 24 GB GPU + 34 GB RAM PC.
 
 Proves end-to-end scale-out of NeuralVM on a model `2.5x` larger than GPU VRAM and `1.8x` larger than System RAM:

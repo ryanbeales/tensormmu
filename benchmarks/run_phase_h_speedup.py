@@ -12,6 +12,10 @@ Benchmarks all three Phase H runtime upgrades on existing `nvm_moe_v1` cartridge
 """
 
 from __future__ import annotations
+import os as _os, sys as _sys
+_REPO_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
 
 import gc
 import json

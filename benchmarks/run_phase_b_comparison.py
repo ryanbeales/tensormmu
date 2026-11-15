@@ -1,3 +1,7 @@
+import os as _os, sys as _sys
+_REPO_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
 """Phase B Driver: Bit-Tiered Resident Core + Persistent GPU LRU Page Cache (TLB) Benchmark.
 
 Performs a direct, hardware-honest apple-to-apple comparison on `google/gemma-4-E2B-it`

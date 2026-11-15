@@ -1,3 +1,7 @@
+import os as _os, sys as _sys
+_REPO_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
 """Phase 3 End-to-End Driver: Full-MLP Tri-Matrix Decompilation & Clustered Memory Pages.
 
 Evaluates across all 16 middle MLP blocks (Layers 10..25, totaling 1,458.00 MB of dense

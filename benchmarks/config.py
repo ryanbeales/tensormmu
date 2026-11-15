@@ -1,3 +1,7 @@
+import os as _os, sys as _sys
+_REPO_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
 """Hyperparameter and runtime configuration for the Neural VM Single-Layer Decompiler PoC."""
 
 from dataclasses import dataclass

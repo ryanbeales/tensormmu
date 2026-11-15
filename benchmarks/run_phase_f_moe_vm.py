@@ -1,22 +1,24 @@
-"""Phase G End-to-End Benchmark: Fused Sparse-MoE Core + Confidence-Gated Speculative Paging + Cross-Layer Lookahead VM.
+"""Phase F End-to-End Benchmark: Zero-Skeleton Sparse MoE Virtual Memory (`nvm_moe_v1`).
 
-Validates the three Phase G architectural upgrades on standalone `nvm_moe_v1` cartridges (`nvme_mmap`)
-on a single 24 GB RTX 4090 + 34.3 GB System RAM workstation:
-  1. Phase G0 (`qwen3_next_kernels.py`): Fused NVRTC `sm_89` RMSNorm, Gated-RMSNorm, Top-K Softmax Router,
-     and GQA-native Conv1d+GDN kernels eliminating ~60-85 ms/pass of Python/CUDA launch overhead.
-  2. Phase G1 (`speculative_vm.py` + `moe_expert_tlb.py`): Sparsity-aware confidence + logit-margin draft
-     gating and Verified-Protected Probationary Draft-LRU eliminating cold-miss amplification & cache thrashing.
-  3. Phase G2 (`moe_lookahead_router.py` + `moe_expert_tlb.py`): Cross-Layer INT8 `LookaheadRouterBank`
-     (`h_{l, mid} -> Layer_{l+1}`) + hazard-free background `nvme_mmap` async DMA overlap.
+Validates Zero-Skeleton Sparse MoE `.nvm` compilation, 4KB-aligned contiguous `UINT4` expert paging,
+deterministic NVRTC multi-token MoE-TLB CUDA kernels, intra-layer Shared-MLP DMA overlap, and
+Two-Tier (`PLD + EagleLiteDraftHead`) speculative amortized paging on a single 24 GB RTX 4090 PC.
 
-Strict Invariants Enforced:
-  - Zero dropped experts & 100% `0-ulp` VM parity across all cache budgets (`slots_min .. slots_max / all_resident`).
-  - Honest PCIe & TLB telemetry (every prefetched byte counted in `pcie_bytes`; pre-prefetch `tlb_hit_rate_pct`
-    reported separately from `effective_stall_free_hit_pct` and `lookahead_precision_pct`).
-  - Zero eval/test benchmark leakage (`LookaheadRouterBank` calibrated strictly on `Logic_Calib + Fact_Calib`).
+Stages (each isolatable in a fresh OS process via `--stage all` for uncontaminated RAM/VRAM telemetry):
+  1. `teacher_ppl` : Stream unmodified BF16 checkpoint layer-by-layer (`O(1)` VRAM) for exact ground-truth PPL.
+  2. `offload_ref` : Measure honest BF16 GPU+Host Layer Offloading (`use_cache=True`) fitting `< 24 GB` VRAM.
+  3. `compile`     : Stream-compile Zero-Skeleton `nvm_moe_v1` cartridge (`< 2.5 GB` peak VRAM, 0 test leakage).
+  4. `calibrate`   : Train `EagleLiteDraftHead` strictly on `Logic_Calib + Fact_Calib + GSM8K train`.
+  5. `bench`       : Fresh-process cold-boot (`nvme_mmap`) evaluating PPL, 5-point VRAM-vs-Throughput Pareto
+                     sweep (`tlb_slots` = 16, 32, 48, 64, All-Resident 128), `exact_demand` vs `overlap_shared_mlp`,
+                     `0-ulp` parity across all modes, and 20-problem held-out GSM8K (`test`) CoT accuracy & speed.
 """
 
 from __future__ import annotations
+import os as _os, sys as _sys
+_REPO_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
 
 import argparse
 import gc
@@ -39,7 +41,13 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer
 
 from data.calibration import TokenizedSplit, build_contrastive_datasets
-from decompiler.nvm_serializer import load_nvm_cartridge
+from decompiler.nvm_serializer import (
+    compile_streaming_moe_to_nvm,
+    evaluate_streaming_dense_bf16_ppl,
+    load_nvm_cartridge,
+    measure_layer_offload_kv_decode,
+    resolve_hf_snapshot_dir,
+)
 from run_phase4_giant_killer import (
     _build_gsm8k_eval_prompts,
     _extract_gsm8k_answer,
@@ -47,14 +55,12 @@ from run_phase4_giant_killer import (
     _normalize_num_str,
 )
 from run_phase_c2_streaming_nvm import get_os_process_ram_mb
-from runtime.moe_lookahead_router import (
-    LookaheadRouterBank,
-    calibrate_and_save_lookahead_routers,
-)
 from runtime.speculative_vm import (
     EagleLiteDraftHead,
     SpeculativeDecodeStats,
     SpeculativeVMGenerator,
+    build_gsm8k_train_calib_sequences,
+    calibrate_and_save_eagle_draft_head,
 )
 
 
@@ -71,46 +77,6 @@ def _save_json(path: str, data: Dict[str, Any]) -> None:
         json.dump(data, f, indent=2)
 
 
-def _seed_baselines_from_phase_f(data: Dict[str, Any], phase_f_json: str) -> None:
-    if not phase_f_json or not os.path.isfile(phase_f_json):
-        return
-    pf = _load_or_init_json(phase_f_json)
-    for k in ("model_id", "nvm_dir", "teacher_bf16_streaming", "layer_offload_bf16", "compile_telemetry"):
-        if k in pf and k not in data:
-            data[k] = pf[k]
-    if "phase_f_baseline_summary" not in data and "pareto_vram_sweep" in pf:
-        pf_pareto = {
-            cfg: {
-                "tok_per_s": v.get("combined_mean_tok_per_s"),
-                "ms_per_tok": v.get("combined_mean_ms_per_tok"),
-                "pcie_mb_per_tok": v.get("combined_mean_pcie_mb_per_tok"),
-                "tlb_hit_pct": v.get("combined_mean_tlb_hit_pct"),
-                "tokens_per_step": v.get("combined_mean_tokens_per_step"),
-                "cuda_allocated_mb": v.get("cuda_allocated_mb"),
-            }
-            for cfg, v in pf["pareto_vram_sweep"].items()
-        }
-        pf_gsm = {}
-        for gk, gv in pf.get("gsm8k_cot_suite", {}).items():
-            if isinstance(gv, dict) and "tok_per_s" in gv:
-                pf_gsm[gk] = {
-                    "solved": gv.get("solved"),
-                    "total": gv.get("total"),
-                    "accuracy_pct": gv.get("accuracy_pct"),
-                    "tok_per_s": gv.get("tok_per_s"),
-                    "ms_per_token": gv.get("ms_per_token"),
-                    "tokens_per_step": gv.get("tokens_per_step"),
-                    "acceptance_rate_pct": gv.get("acceptance_rate_pct"),
-                    "pcie_mb_per_token": gv.get("pcie_mb_per_token"),
-                    "tlb_hit_rate_pct": gv.get("tlb_hit_rate_pct"),
-                }
-        data["phase_f_baseline_summary"] = {
-            "source_json": phase_f_json,
-            "pareto_vram_sweep": pf_pareto,
-            "gsm8k_cot_suite": pf_gsm,
-        }
-
-
 def _format_gsm8k_prompt(tokenizer: Any, question: str) -> str:
     instruction = (
         "Solve this math problem concisely step by step. "
@@ -124,39 +90,6 @@ def _format_gsm8k_prompt(tokenizer: Any, question: str) -> str:
         except Exception:
             return instruction + "\nAnswer:"
     return instruction + "\nAnswer:"
-
-
-@torch.no_grad()
-def _measure_core_only_pass_ms(model: torch.nn.Module, moe_layers: Dict[int, Any], device: str = "cuda:0") -> Dict[str, float]:
-    """Measures pure `core_only` (`0` expert pages) GPU forward pass time at `M=1` and `M=4`."""
-    dev = torch.device(device)
-    for m in moe_layers.values():
-        m.set_mode("core_only")
-    prompt = torch.randint(100, 2000, (1, 128), device=dev)
-    mask = torch.ones((1, 256), dtype=torch.long, device=dev)
-    results: Dict[str, float] = {}
-
-    for m_tok in (1, 4):
-        out = model(input_ids=prompt, attention_mask=mask[:, :128], use_cache=True)
-        pkv = out.past_key_values
-        cur_len = 128
-        for _ in range(4):
-            cur_len += m_tok
-            out = model(input_ids=prompt[:, :m_tok], attention_mask=mask[:, :cur_len], past_key_values=pkv, use_cache=True)
-            pkv = out.past_key_values
-        torch.cuda.synchronize(dev)
-
-        n_iters = 12
-        t0 = time.perf_counter()
-        for _ in range(n_iters):
-            cur_len += m_tok
-            out = model(input_ids=prompt[:, :m_tok], attention_mask=mask[:, :cur_len], past_key_values=pkv, use_cache=True)
-            pkv = out.past_key_values
-        torch.cuda.synchronize(dev)
-        results[f"m{m_tok}_ms_per_pass"] = ((time.perf_counter() - t0) * 1000.0) / float(n_iters)
-        del pkv, out
-
-    return results
 
 
 @torch.no_grad()
@@ -226,12 +159,7 @@ def _bench_eval_prompts(
     total_eag_acc = 0
     total_elapsed_s = 0.0
     total_pcie_mb = 0.0
-    total_demand_misses = 0
-    total_la_pref = 0
-    total_la_hits = 0
-    total_la_wasted = 0
     hit_rates: List[float] = []
-    eff_hit_rates: List[float] = []
     all_gen_ids: List[List[int]] = []
 
     for p_ids in prompts:
@@ -251,19 +179,11 @@ def _bench_eval_prompts(
         total_eag_acc += st.eagle_accepted
         total_elapsed_s += st.elapsed_s
         total_pcie_mb += st.total_pcie_mb
-        total_demand_misses += st.demand_misses
-        total_la_pref += st.lookahead_prefetched
-        total_la_hits += st.lookahead_hits
-        total_la_wasted += st.lookahead_wasted
         hit_rates.append(st.tlb_hit_rate_pct)
-        eff_hit_rates.append(st.effective_stall_free_hit_pct)
         all_gen_ids.append(st.generated_ids)
 
     em = max(1, total_emitted)
     st_cnt = max(1, total_steps)
-    tot_misses = max(1, total_demand_misses + total_la_hits)
-    la_prec = 100.0 * float(total_la_hits) / float(max(1, total_la_pref)) if total_la_pref > 0 else 0.0
-    la_cov = 100.0 * float(total_la_hits) / float(tot_misses) if total_la_hits > 0 else 0.0
     return {
         "emitted_tokens": total_emitted,
         "forward_steps": total_steps,
@@ -281,13 +201,6 @@ def _bench_eval_prompts(
         "pcie_mb_per_token": total_pcie_mb / float(em),
         "pcie_mb_per_step": total_pcie_mb / float(st_cnt),
         "tlb_hit_rate_pct": sum(hit_rates) / max(1, len(hit_rates)),
-        "effective_stall_free_hit_pct": sum(eff_hit_rates) / max(1, len(eff_hit_rates)),
-        "demand_misses": total_demand_misses,
-        "lookahead_prefetched": total_la_pref,
-        "lookahead_hits": total_la_hits,
-        "lookahead_wasted": total_la_wasted,
-        "lookahead_precision_pct": la_prec,
-        "lookahead_coverage_pct": la_cov,
         "generated_ids_per_prompt": all_gen_ids,
     }
 
@@ -298,7 +211,7 @@ def _evaluate_gsm8k_speculative(
     problems: List[Tuple[str, str]],
     max_new_tokens: int = 320,
     device: str = "cuda:0",
-    label: str = "Phase G",
+    label: str = "Phase F",
 ) -> Dict[str, Any]:
     correct = 0
     total = len(problems)
@@ -312,12 +225,7 @@ def _evaluate_gsm8k_speculative(
     total_eag_acc = 0
     total_elapsed_s = 0.0
     total_pcie_mb = 0.0
-    total_demand_misses = 0
-    total_la_pref = 0
-    total_la_hits = 0
-    total_la_wasted = 0
     hit_rates: List[float] = []
-    eff_hit_rates: List[float] = []
     per_problem: List[Dict[str, Any]] = []
 
     for idx, (question, target_ans) in enumerate(problems):
@@ -345,12 +253,7 @@ def _evaluate_gsm8k_speculative(
         total_eag_acc += st.eagle_accepted
         total_elapsed_s += st.elapsed_s
         total_pcie_mb += st.total_pcie_mb
-        total_demand_misses += st.demand_misses
-        total_la_pref += st.lookahead_prefetched
-        total_la_hits += st.lookahead_hits
-        total_la_wasted += st.lookahead_wasted
         hit_rates.append(st.tlb_hit_rate_pct)
-        eff_hit_rates.append(st.effective_stall_free_hit_pct)
 
         per_problem.append(
             {
@@ -363,10 +266,8 @@ def _evaluate_gsm8k_speculative(
                 "tokens_per_step": st.tokens_per_step,
                 "ms_per_token": st.ms_per_token,
                 "tok_per_s": st.tok_per_s,
-                "acceptance_rate_pct": st.acceptance_rate_pct,
                 "pcie_mb_per_token": st.pcie_mb_per_token,
                 "tlb_hit_rate_pct": st.tlb_hit_rate_pct,
-                "effective_stall_free_hit_pct": st.effective_stall_free_hit_pct,
             }
         )
         if (idx + 1) % 5 == 0 or (idx + 1) == total:
@@ -374,13 +275,10 @@ def _evaluate_gsm8k_speculative(
             cur_mul = float(max(1, total_emitted)) / float(max(1, total_steps))
             cur_pcie = total_pcie_mb / float(max(1, total_emitted))
             cur_hit = sum(hit_rates) / max(1, len(hit_rates))
-            cur_eff = sum(eff_hit_rates) / max(1, len(eff_hit_rates))
-            cur_acc = 100.0 * float(total_acc) / float(max(1, total_prop)) if total_prop > 0 else 0.0
             print(
                 f"  [{label} GSM8K {idx+1:02d}/{total:02d}] Solved={correct}/{idx+1} | "
                 f"Speed={cur_tps:.2f} tok/s ({1000.0/max(1e-6,cur_tps):.1f} ms/tok) | "
-                f"Tok/Step={cur_mul:.2f}x (Acc={cur_acc:.1f}%) | TLB={cur_hit:.1f}%->Eff={cur_eff:.1f}% | "
-                f"PCIe={cur_pcie:.1f} MB/tok",
+                f"Tok/Step={cur_mul:.2f}x | TLB Hit={cur_hit:.1f}% | PCIe={cur_pcie:.1f} MB/tok",
                 flush=True,
             )
 
@@ -388,7 +286,6 @@ def _evaluate_gsm8k_speculative(
     st_cnt = max(1, total_steps)
     cuda_alloc_mb, cuda_peak_mb = _get_cuda_mem_mb()
     ram_info = get_os_process_ram_mb()
-    tot_misses = max(1, total_demand_misses + total_la_hits)
 
     return {
         "solved": correct,
@@ -410,17 +307,6 @@ def _evaluate_gsm8k_speculative(
         "pcie_mb_per_token": total_pcie_mb / float(em),
         "pcie_mb_per_step": total_pcie_mb / float(st_cnt),
         "tlb_hit_rate_pct": sum(hit_rates) / max(1, len(hit_rates)),
-        "effective_stall_free_hit_pct": sum(eff_hit_rates) / max(1, len(eff_hit_rates)),
-        "demand_misses": total_demand_misses,
-        "lookahead_prefetched": total_la_pref,
-        "lookahead_hits": total_la_hits,
-        "lookahead_wasted": total_la_wasted,
-        "lookahead_precision_pct": (
-            100.0 * float(total_la_hits) / float(max(1, total_la_pref)) if total_la_pref > 0 else 0.0
-        ),
-        "lookahead_coverage_pct": (
-            100.0 * float(total_la_hits) / float(tot_misses) if total_la_hits > 0 else 0.0
-        ),
         "cuda_allocated_mb": cuda_alloc_mb,
         "cuda_peak_mb": cuda_peak_mb,
         "os_working_set_mb": ram_info["ws_mb"],
@@ -429,12 +315,124 @@ def _evaluate_gsm8k_speculative(
     }
 
 
-def stage_calibrate_lookahead(args: argparse.Namespace) -> None:
+def stage_teacher_ppl(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
+    snap_dir = resolve_hf_snapshot_dir(args.model_id)
+    tokenizer = AutoTokenizer.from_pretrained(snap_dir, local_files_only=True)
+    bundle = build_contrastive_datasets(
+        tokenizer=tokenizer,
+        num_calibration_seqs=16,
+        num_eval_seqs=4,
+        seq_len=256,
+        seed=args.seed,
+        allow_hf_download=False,
+    )
+    print(f"[Phase F Teacher] Streaming exact unmodified BF16 Teacher PPL on '{args.model_id}'...", flush=True)
+    bf16_res = evaluate_streaming_dense_bf16_ppl(
+        model_id_or_path=snap_dir,
+        splits={"Logic_Eval": bundle.logic_eval, "Fact_Eval": bundle.fact_eval},
+        batch_size=2,
+        device=args.device,
+    )
+    preds_path = os.path.join(os.path.dirname(os.path.abspath(args.out_json)), f"{args.tag}_teacher_preds.pt")
+    torch.save(
+        {sn: bf16_res["splits"][sn].pop("preds") for sn in ("Logic_Eval", "Fact_Eval")},
+        preds_path,
+    )
     data = _load_or_init_json(args.out_json)
-    _seed_baselines_from_phase_f(data, args.phase_f_json)
+    data["model_id"] = args.model_id
+    data["teacher_bf16_streaming"] = bf16_res
+    _save_json(args.out_json, data)
+    print(
+        f"[Phase F Teacher] Logic_Eval PPL={bf16_res['splits']['Logic_Eval']['perplexity']:.4f} | "
+        f"Fact_Eval PPL={bf16_res['splits']['Fact_Eval']['perplexity']:.4f} | "
+        f"Peak VRAM={bf16_res['peak_vram_mb']:.1f} MB | Wall={bf16_res['wall_s']:.1f}s",
+        flush=True,
+    )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.nvm_dir, local_files_only=True)
+
+def stage_offload_ref(args: argparse.Namespace) -> None:
+    torch.manual_seed(args.seed)
+    snap_dir = resolve_hf_snapshot_dir(args.model_id)
+    tokenizer = AutoTokenizer.from_pretrained(snap_dir, local_files_only=True)
+    bundle = build_contrastive_datasets(
+        tokenizer=tokenizer,
+        num_calibration_seqs=16,
+        num_eval_seqs=4,
+        seq_len=256,
+        seed=args.seed,
+        allow_hf_download=False,
+    )
+    print(
+        f"[Phase F Offload Ref] Measuring BF16 Layer-Offload KV decode (num_gpu_layers={args.offload_gpu_layers})...",
+        flush=True,
+    )
+    ram0 = get_os_process_ram_mb()
+    off_dec_toks = 3 if int(args.offload_gpu_layers) <= 6 else 6
+    off_res = measure_layer_offload_kv_decode(
+        model_id_or_path=snap_dir,
+        prompt_ids=bundle.fact_eval.input_ids[:1, :64],
+        num_gpu_layers=args.offload_gpu_layers,
+        num_decode_tokens=off_dec_toks,
+        warmup_steps=1,
+        device=args.device,
+    )
+    off_res["os_working_set_mb_after"] = get_os_process_ram_mb()["ws_mb"]
+    off_res["os_working_set_mb_before"] = ram0["ws_mb"]
+    data = _load_or_init_json(args.out_json)
+    data["layer_offload_bf16"] = off_res
+    _save_json(args.out_json, data)
+    print(
+        f"[Phase F Offload Ref] {off_res['decode_tok_per_s']:.3f} tok/s ({off_res['decode_ms_per_tok']:.1f} ms/tok) | "
+        f"CUDA={off_res['resident_cuda_mb']:.1f} MB | PCIe={off_res['pcie_mb_per_token']:.1f} MB/tok",
+        flush=True,
+    )
+
+
+def stage_compile(args: argparse.Namespace) -> None:
+    torch.manual_seed(args.seed)
+    snap_dir = resolve_hf_snapshot_dir(args.model_id)
+    tokenizer = AutoTokenizer.from_pretrained(snap_dir, local_files_only=True)
+    bundle = build_contrastive_datasets(
+        tokenizer=tokenizer,
+        num_calibration_seqs=16,
+        num_eval_seqs=4,
+        seq_len=256,
+        seed=args.seed,
+        allow_hf_download=False,
+    )
+    print(f"[Phase F Compile] Compiling Zero-Skeleton MoE .nvm cartridge -> {args.nvm_dir}", flush=True)
+    manifest = compile_streaming_moe_to_nvm(
+        model_id_or_path=snap_dir,
+        nvm_dir=args.nvm_dir,
+        bundle=bundle,
+        tlb_slots=args.default_tlb_slots,
+        expert_group_size=args.expert_group_size,
+        expert_chunk_size=64,
+        attn_quant=args.attn_quant,
+        shared_mlp_quant=args.shared_mlp_quant,
+        lm_head_quant=args.lm_head_quant,
+        calib_batch_size=4,
+        max_calib_tokens=4096,
+        device=args.device,
+    )
+    data = _load_or_init_json(args.out_json)
+    data["compile_telemetry"] = manifest["compile_telemetry"]
+    data["nvm_dir"] = args.nvm_dir
+    _save_json(args.out_json, data)
+    ct = manifest["compile_telemetry"]
+    print(
+        f"[Phase F Compile] Done in {ct['compile_wall_s']:.1f}s | Peak VRAM={ct['peak_compile_vram_mb']:.1f} MB | "
+        f"Core={ct['core_resident_disk_mb']:.1f} MB + Expert Pages={ct['pages_disk_mb']:.1f} MB "
+        f"(Total={ct['total_disk_mb']:.1f} MB)",
+        flush=True,
+    )
+
+
+def stage_calibrate(args: argparse.Namespace) -> None:
+    torch.manual_seed(args.seed)
+    snap_dir = resolve_hf_snapshot_dir(args.model_id)
+    tokenizer = AutoTokenizer.from_pretrained(snap_dir, local_files_only=True)
     bundle = build_contrastive_datasets(
         tokenizer=tokenizer,
         num_calibration_seqs=16,
@@ -444,48 +442,46 @@ def stage_calibrate_lookahead(args: argparse.Namespace) -> None:
         allow_hf_download=False,
     )
     calib_seqs: List[torch.Tensor] = []
-    for i in range(int(bundle.logic_calib.input_ids.shape[0])):
+    for i in range(min(12, bundle.logic_calib.input_ids.shape[0])):
         calib_seqs.append(bundle.logic_calib.input_ids[i].clone())
-    for i in range(int(bundle.fact_calib.input_ids.shape[0])):
+    for i in range(min(12, bundle.fact_calib.input_ids.shape[0])):
         calib_seqs.append(bundle.fact_calib.input_ids[i].clone())
+    gsm_train_seqs = build_gsm8k_train_calib_sequences(tokenizer, num_examples=18, max_seq_len=256)
+    calib_seqs.extend(gsm_train_seqs)
 
     print(
-        f"[Phase G2 Calibrate] Calibrating Cross-Layer LookaheadRouterBank on {len(calib_seqs)} strictly held-in "
-        f"calibration sequences (0 eval/test leakage) -> {args.nvm_dir}",
+        f"[Phase F Calibrate] Training EagleLiteDraftHead on {len(calib_seqs)} strictly held-in calib sequences...",
         flush=True,
     )
-    cal_metrics = calibrate_and_save_lookahead_routers(
+    calibrate_and_save_eagle_draft_head(
         nvm_dir=args.nvm_dir,
         calib_token_sequences=calib_seqs,
-        k_pre=args.k_pre if args.k_pre > 0 else None,
-        ridge_lambda=10.0,
-        kl_steps=args.lookahead_kl_steps,
-        lr=3.0e-3,
-        batch_size=4,
-        tlb_slots_override=max(args.default_tlb_slots, 64),
+        shortlist_size=12288,
+        d_latent=1024,
+        d_ffn=1536,
+        epochs=args.eagle_epochs,
+        lr=2.0e-3,
+        rollout_horizon=4,
+        tlb_slots_override=args.default_tlb_slots,
         device=args.device,
     )
-    data["lookahead_calibration"] = cal_metrics
-    _save_json(args.out_json, data)
 
 
 def stage_bench(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     data = _load_or_init_json(args.out_json)
-    _seed_baselines_from_phase_f(data, args.phase_f_json)
-
     ram_base = get_os_process_ram_mb()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-    print(f"[Phase G Bench] Cold-booting MoE .nvm cartridge (nvme_mmap) from {args.nvm_dir}...", flush=True)
+    print(f"[Phase F Bench] Cold-booting MoE .nvm cartridge (nvme_mmap) from {args.nvm_dir}...", flush=True)
     model, tokenizer, moe_layers, lut_pool, ple_off, manifest = load_nvm_cartridge(
         nvm_dir=args.nvm_dir,
         device=args.device,
         dtype=torch.bfloat16,
         mode="vm_paged",
-        tlb_strategy="lookahead_overlap",
+        tlb_strategy="overlap_shared_mlp",
         page_storage="nvme_mmap",
         tlb_slots_override=args.default_tlb_slots,
         use_phase_c_kernels=True,
@@ -494,23 +490,15 @@ def stage_bench(args: argparse.Namespace) -> None:
     boot_info = manifest["last_cold_boot"]
     ram_after_boot = get_os_process_ram_mb()
 
-    # Measure core-only resident VRAM + Phase G0 fused core forward speed (`M=1` & `M=4`)
+    # Measure core-only resident VRAM (0 expert TLB slots)
     for m in moe_layers.values():
         m.set_mode("core_only")
     torch.cuda.empty_cache()
     core_only_cuda_mb, _ = _get_cuda_mem_mb()
-    core_pass_telemetry = _measure_core_only_pass_ms(model, moe_layers, device=args.device)
-    print(
-        f"[Phase G0 Core] M=1={core_pass_telemetry['m1_ms_per_pass']:.2f} ms/pass | "
-        f"M=4={core_pass_telemetry['m4_ms_per_pass']:.2f} ms/pass | Core VRAM={core_only_cuda_mb:,.1f} MB",
-        flush=True,
-    )
 
-    # Restore default TLB slots and load EagleLiteDraftHead + LookaheadRouterBank
+    # Restore default TLB slots and load EagleLiteDraftHead
     for m in moe_layers.values():
         m.set_mode("vm_paged", tlb_slots_override=args.default_tlb_slots)
-        m.set_tlb_strategy("lookahead_overlap")
-
     draft_head = EagleLiteDraftHead.load_pretrained_nvm(
         nvm_dir=args.nvm_dir,
         device=args.device,
@@ -518,24 +506,12 @@ def stage_bench(args: argparse.Namespace) -> None:
         lut_pool=lut_pool,
     )
     draft_vram_mb = draft_head.vram_bytes() / float(1024 ** 2)
-
-    assert LookaheadRouterBank.has_saved_nvm(args.nvm_dir), (
-        f"Missing `lookahead_routers.safetensors` in {args.nvm_dir}. Run `--stage calibrate_lookahead` first."
-    )
-    lookahead_bank = LookaheadRouterBank.load_pretrained_nvm(
-        nvm_dir=args.nvm_dir,
-        device=args.device,
-        lut_pool=lut_pool,
-        k_pre_override=args.k_pre if args.k_pre > 0 else None,
-    )
-    n_attached = lookahead_bank.attach_to_moe_layers(moe_layers)
-    lookahead_vram_mb = lookahead_bank.vram_bytes() / float(1024 ** 2)
-    ram_with_heads = get_os_process_ram_mb()
+    ram_with_draft = get_os_process_ram_mb()
 
     print(
-        f"[Phase G Bench] Cold-boot={boot_info['cold_boot_s']:.2f}s | Core CUDA={core_only_cuda_mb:,.1f} MB | "
-        f"EagleHead={draft_vram_mb:.1f} MB | LookaheadBank({n_attached} pairs)={lookahead_vram_mb:.1f} MB | "
-        f"OS Working Set={ram_with_heads['ws_mb']:,.1f} MB (+{ram_with_heads['ws_mb'] - ram_base['ws_mb']:.1f} MB)",
+        f"[Phase F Bench] Cold-boot={boot_info['cold_boot_s']:.2f}s | Core-Only Resident CUDA={core_only_cuda_mb:,.1f} MB | "
+        f"EagleLiteDraftHead={draft_vram_mb:.1f} MB | OS Working Set={ram_with_draft['ws_mb']:,.1f} MB "
+        f"(+{ram_with_draft['ws_mb'] - ram_base['ws_mb']:.1f} MB)",
         flush=True,
     )
 
@@ -550,10 +526,9 @@ def stage_bench(args: argparse.Namespace) -> None:
     preds_path = os.path.join(os.path.dirname(os.path.abspath(args.out_json)), f"{args.tag}_teacher_preds.pt")
     teacher_preds = torch.load(preds_path, map_location="cpu", weights_only=True) if os.path.isfile(preds_path) else None
 
-    # 1. Exact Perplexity & 0-ulp Resident vs Lookahead-Paged PPL Parity on Held-Out `Logic_Eval` & `Fact_Eval`
-    print("[Phase G Bench] Evaluating Logic_Eval & Fact_Eval Perplexity (vm_paged lookahead vs all_resident/high_slots)...", flush=True)
+    # 1. Exact Perplexity & 0-ulp Resident vs Paged PPL Parity on Held-Out `Logic_Eval` & `Fact_Eval`
+    print("[Phase F Bench] Evaluating Logic_Eval & Fact_Eval Perplexity (vm_paged vs all_resident)...", flush=True)
     for m in moe_layers.values():
-        m.set_tlb_strategy("lookahead_overlap")
         m.set_mode("vm_paged", tlb_slots_override=args.default_tlb_slots)
         m.reset_telemetry(clear_tlb=True)
     ppl_paged = _evaluate_loaded_model_ppl(
@@ -571,6 +546,7 @@ def stage_bench(args: argparse.Namespace) -> None:
         < 21500.0
     )
     pareto_slots = [int(x) for x in args.pareto_slots.split(",") if x.strip()]
+    ppl_resident = None
     if can_fit_all_resident:
         for m in moe_layers.values():
             m.set_mode("all_resident")
@@ -581,81 +557,60 @@ def stage_bench(args: argparse.Namespace) -> None:
             batch_size=2,
             device=args.device,
         )
-        ref_label = "all_resident"
+        for sn in ("Logic_Eval", "Fact_Eval"):
+            diff_loss = abs(ppl_paged[sn]["loss"] - ppl_resident[sn]["loss"])
+            print(
+                f"  [{sn}] vm_paged PPL={ppl_paged[sn]['perplexity']:.4f} | "
+                f"all_resident PPL={ppl_resident[sn]['perplexity']:.4f} | "
+                f"|delta_loss|={diff_loss:.2e} | Teacher Top-1 Agree={ppl_paged[sn]['teacher_top1_agreement_pct']:.2f}%",
+                flush=True,
+            )
     else:
         max_sl = max(pareto_slots) if pareto_slots else args.default_tlb_slots
         for m in moe_layers.values():
             m.set_mode("vm_paged", tlb_slots_override=max_sl)
             m.reset_telemetry(clear_tlb=True)
-        ppl_resident = _evaluate_loaded_model_ppl(
+        ppl_high = _evaluate_loaded_model_ppl(
             model,
             {"Logic_Eval": bundle.logic_eval, "Fact_Eval": bundle.fact_eval},
             teacher_preds_by_split=teacher_preds,
             batch_size=2,
             device=args.device,
         )
-        ref_label = f"vm_paged(slots={max_sl})"
+        ppl_resident = ppl_high
+        for sn in ("Logic_Eval", "Fact_Eval"):
+            diff_loss = abs(ppl_paged[sn]["loss"] - ppl_high[sn]["loss"])
+            print(
+                f"  [{sn}] vm_paged(slots={args.default_tlb_slots}) PPL={ppl_paged[sn]['perplexity']:.4f} | "
+                f"vm_paged(slots={max_sl}) PPL={ppl_high[sn]['perplexity']:.4f} | "
+                f"|delta_loss|={diff_loss:.2e} | Teacher Top-1 Agree={ppl_paged[sn]['teacher_top1_agreement_pct']:.2f}%",
+                flush=True,
+            )
 
-    for sn in ("Logic_Eval", "Fact_Eval"):
-        diff_loss = abs(ppl_paged[sn]["loss"] - ppl_resident[sn]["loss"])
-        assert diff_loss < 1e-6, f"PPL parity violation on {sn}: diff_loss={diff_loss}"
-        t_ag = ppl_paged[sn]["teacher_top1_agreement_pct"]
-        t_ag_str = f"{t_ag:.2f}%" if t_ag is not None else "N/A"
-        print(
-            f"  [{sn}] vm_paged(lookahead) PPL={ppl_paged[sn]['perplexity']:.4f} | "
-            f"{ref_label} PPL={ppl_resident[sn]['perplexity']:.4f} | "
-            f"|delta_loss|={diff_loss:.2e} | Teacher Top-1 Agree={t_ag_str}",
-            flush=True,
-        )
-
-    # 2. VRAM vs Throughput Pareto + Ablation Sweep (`nvme_mmap`) + Hard 0-ulp Cross-Budget Token Parity!
+    # 2. VRAM vs Throughput Pareto Sweep (`nvme_mmap`) + Intra-Layer Overlap Ablation + 0-ulp Token Parity!
     fact_prompts = [bundle.fact_eval.input_ids[i : i + 1, :128].to(args.device) for i in range(2)]
     logic_prompts = [bundle.logic_eval.input_ids[i : i + 1, :128].to(args.device) for i in range(2)]
 
     pareto_results: Dict[str, Any] = {}
-    ref_tokens_by_family: Dict[str, Tuple[List[List[int]], List[List[int]]]] = {}
+    ref_tokens_by_dmode: Dict[str, Tuple[List[List[int]], List[List[int]]]] = {}
 
-    low_vram_slots = min(max(32, num_experts_per_layer // 8), num_experts_per_layer)
-    ablation_slots = {pareto_slots[0], low_vram_slots} if pareto_slots else {low_vram_slots}
-
-    # Tuple: `(cfg_key, parity_family, vm_mode, sl_cnt, strat, d_mode, conf_gated)`
-    sweep_configs: List[Tuple[str, str, str, int, str, str, bool]] = []
+    sweep_configs: List[Tuple[str, str, int, str, str]] = []
     for sl in pareto_slots:
         if sl < num_experts_per_layer:
-            sweep_configs.append((f"slots_{sl}_m1_demand", "m1", "vm_paged", sl, "exact_demand", "none", False))
-            sweep_configs.append((f"slots_{sl}_m1_overlap", "m1", "vm_paged", sl, "overlap_shared_mlp", "none", False))
-            sweep_configs.append((f"slots_{sl}_m1_lookahead", "m1", "vm_paged", sl, "lookahead_overlap", "none", False))
-            if sl in ablation_slots:
-                sweep_configs.append(
-                    (f"slots_{sl}_spec_ungated_intra", "spec_ungated", "vm_paged", sl, "overlap_shared_mlp", "two_tier", False)
-                )
-                sweep_configs.append(
-                    (f"slots_{sl}_spec_gated_overlap", "spec_phase_g", "vm_paged", sl, "overlap_shared_mlp", "two_tier", True)
-                )
-            sweep_configs.append(
-                (f"slots_{sl}_spec_phase_g", "spec_phase_g", "vm_paged", sl, "lookahead_overlap", "two_tier", True)
-            )
+            sweep_configs.append((f"slots_{sl}_m1_demand", "vm_paged", sl, "exact_demand", "none"))
+            sweep_configs.append((f"slots_{sl}_m1_overlap", "vm_paged", sl, "overlap_shared_mlp", "none"))
+            sweep_configs.append((f"slots_{sl}_spec_two_tier", "vm_paged", sl, "overlap_shared_mlp", "two_tier"))
     if can_fit_all_resident:
+        sweep_configs.append(("all_resident_m1", "all_resident", num_experts_per_layer, "overlap_shared_mlp", "none"))
         sweep_configs.append(
-            ("all_resident_m1", "m1", "all_resident", num_experts_per_layer, "lookahead_overlap", "none", False)
-        )
-        sweep_configs.append(
-            (
-                "all_resident_spec_phase_g",
-                "spec_phase_g",
-                "all_resident",
-                num_experts_per_layer,
-                "lookahead_overlap",
-                "two_tier",
-                True,
-            )
+            ("all_resident_spec_two_tier", "all_resident", num_experts_per_layer, "overlap_shared_mlp", "two_tier")
         )
 
     print(
-        f"[Phase G Bench] Running {len(sweep_configs)}-point Pareto & Ablation Sweep ({args.eval_decode_tokens} tok x 4 prompts)...",
+        f"[Phase F Bench] Running {len(sweep_configs)}-point VRAM-vs-Throughput Pareto Sweep ({args.eval_decode_tokens} tok x 4 prompts)...",
         flush=True,
     )
-    for cfg_key, family, vm_mode, sl_cnt, strat, d_mode, conf_gated in sweep_configs:
+    for cfg_key, vm_mode, sl_cnt, strat, d_mode in sweep_configs:
         for m in moe_layers.values():
             m.set_tlb_strategy(strat)
             m.set_mode(vm_mode, tlb_slots_override=sl_cnt)
@@ -672,7 +627,6 @@ def stage_bench(args: argparse.Namespace) -> None:
             draft_mode=d_mode,
             max_draft_tokens=3,
             pld_long_draft_tokens=4,
-            confidence_gated_moe=conf_gated,
         )
         f_res = _bench_eval_prompts(gen, fact_prompts, max_new_tokens=args.eval_decode_tokens)
         l_res = _bench_eval_prompts(gen, logic_prompts, max_new_tokens=args.eval_decode_tokens)
@@ -681,17 +635,18 @@ def stage_bench(args: argparse.Namespace) -> None:
 
         f_ids = f_res.pop("generated_ids_per_prompt")
         l_ids = l_res.pop("generated_ids_per_prompt")
-        if family not in ref_tokens_by_family:
-            ref_tokens_by_family[family] = (f_ids, l_ids)
+        if d_mode not in ref_tokens_by_dmode:
+            ref_tokens_by_dmode[d_mode] = (f_ids, l_ids)
             parity_exact = True
         else:
-            rf, rl = ref_tokens_by_family[family]
+            rf, rl = ref_tokens_by_dmode[d_mode]
             parity_exact = (f_ids == rf) and (l_ids == rl)
-            assert parity_exact, f"0-ulp VM parity mismatch in '{cfg_key}' vs '{family}' reference!"
+            assert parity_exact, f"0-ulp VM parity mismatch in '{cfg_key}' vs '{d_mode}' reference!"
 
+        # Also measure exact token-prefix agreement against M=1 (note: cuBLAS GEMV M=1 vs TensorCore M=4 can differ by 1 BF16 ULP)
         m1_prefix_matches: List[int] = []
-        if "m1" in ref_tokens_by_family:
-            m1_f, m1_l = ref_tokens_by_family["m1"]
+        if "none" in ref_tokens_by_dmode:
+            m1_f, m1_l = ref_tokens_by_dmode["none"]
             for a, b in list(zip(f_ids, m1_f)) + list(zip(l_ids, m1_l)):
                 pref = 0
                 for ta, tb in zip(a, b):
@@ -704,20 +659,14 @@ def stage_bench(args: argparse.Namespace) -> None:
         mean_tps = 1000.0 / max(1e-6, mean_ms)
         mean_pcie = 0.5 * (f_res["pcie_mb_per_token"] + l_res["pcie_mb_per_token"])
         mean_hit = 0.5 * (f_res["tlb_hit_rate_pct"] + l_res["tlb_hit_rate_pct"])
-        mean_eff_hit = 0.5 * (f_res["effective_stall_free_hit_pct"] + l_res["effective_stall_free_hit_pct"])
         mean_mul = 0.5 * (f_res["tokens_per_step"] + l_res["tokens_per_step"])
-        mean_acc = 0.5 * (f_res["acceptance_rate_pct"] + l_res["acceptance_rate_pct"])
-        mean_la_prec = 0.5 * (f_res["lookahead_precision_pct"] + l_res["lookahead_precision_pct"])
-        mean_la_cov = 0.5 * (f_res["lookahead_coverage_pct"] + l_res["lookahead_coverage_pct"])
 
         pareto_results[cfg_key] = {
-            "parity_family": family,
             "vm_mode": vm_mode,
             "tlb_slots": sl_cnt,
             "cache_pct": 100.0 * float(sl_cnt) / float(num_experts_per_layer),
             "tlb_strategy": strat,
             "draft_mode": d_mode,
-            "confidence_gated_moe": conf_gated,
             "cuda_allocated_mb": alloc_mb,
             "cuda_peak_mb": peak_mb,
             "os_working_set_mb": ram_cur["ws_mb"],
@@ -728,18 +677,13 @@ def stage_bench(args: argparse.Namespace) -> None:
             "combined_mean_tok_per_s": mean_tps,
             "combined_mean_pcie_mb_per_tok": mean_pcie,
             "combined_mean_tlb_hit_pct": mean_hit,
-            "combined_mean_effective_hit_pct": mean_eff_hit,
-            "combined_mean_lookahead_precision_pct": mean_la_prec,
-            "combined_mean_lookahead_coverage_pct": mean_la_cov,
             "combined_mean_tokens_per_step": mean_mul,
-            "combined_mean_acceptance_pct": mean_acc,
             "fact_eval": f_res,
             "logic_eval": l_res,
         }
         print(
-            f"  [{cfg_key:30s}] VRAM={alloc_mb:7.1f} MB | {mean_tps:5.2f} tok/s ({mean_ms:5.1f} ms/tok) | "
-            f"Tok/Step={mean_mul:.2f}x (Acc={mean_acc:4.1f}%) | TLB={mean_hit:5.1f}%->Eff={mean_eff_hit:5.1f}% | "
-            f"PCIe={mean_pcie:6.1f} MB/tok | 0-ulp={parity_exact}",
+            f"  [{cfg_key:26s}] VRAM={alloc_mb:7.1f} MB | {mean_tps:5.2f} tok/s ({mean_ms:5.1f} ms/tok) | "
+            f"Tok/Step={mean_mul:.2f}x | TLB Hit={mean_hit:5.1f}% | PCIe={mean_pcie:6.1f} MB/tok | 0-ulp VM={parity_exact}",
             flush=True,
         )
 
@@ -747,37 +691,30 @@ def stage_bench(args: argparse.Namespace) -> None:
     gsm8k_problems = _build_gsm8k_eval_prompts(num_problems=args.gsm8k_count, split="test")
     gsm8k_suite: Dict[str, Any] = {}
 
-    # 3a. 5-problem M=1 (`lookahead_overlap`) baseline at low-VRAM budget (`64` on 80B = ~7.9 GB; `32` on 26B = ~6.3 GB)
+    # 3a. 5-problem M=1 baseline at low-VRAM cache budget (`32` on 26B = ~6.2 GB VRAM; `64` on 80B = ~7.8 GB VRAM!)
+    low_vram_slots = min(max(32, num_experts_per_layer // 8), num_experts_per_layer)
     for m in moe_layers.values():
-        m.set_tlb_strategy("lookahead_overlap")
+        m.set_tlb_strategy("overlap_shared_mlp")
         m.set_mode("vm_paged", tlb_slots_override=low_vram_slots)
         m.reset_telemetry(clear_tlb=True)
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
-    gen_low_m1 = SpeculativeVMGenerator(
-        model=model,
-        tokenizer=tokenizer,
-        phase_b_mlps=moe_layers,
-        draft_mode="none",
-        confidence_gated_moe=False,
+    gen_32_m1 = SpeculativeVMGenerator(
+        model=model, tokenizer=tokenizer, phase_b_mlps=moe_layers, draft_mode="none"
     )
-    print(f"[Phase G GSM8K] 5-Problem M=1 Lookahead Baseline (tlb_slots={low_vram_slots}, nvme_mmap)...", flush=True)
-    gsm8k_suite[f"vm_slots_{low_vram_slots}_m1_lookahead_5prob"] = _evaluate_gsm8k_speculative(
-        gen_low_m1,
-        gsm8k_problems[:5],
-        max_new_tokens=args.gsm8k_max_tokens,
-        device=args.device,
-        label=f"Slots{low_vram_slots}-M1-LA",
+    print(f"[Phase F GSM8K] 5-Problem M=1 Parity Baseline (tlb_slots={low_vram_slots}, nvme_mmap)...", flush=True)
+    gsm8k_suite[f"vm_slots_{low_vram_slots}_m1_5prob"] = _evaluate_gsm8k_speculative(
+        gen_32_m1, gsm8k_problems[:5], max_new_tokens=args.gsm8k_max_tokens, device=args.device, label=f"Slots{low_vram_slots}-M1"
     )
 
-    # 3b. Full 20-problem GSM8K at `low_vram_slots` + Full Phase G (`lookahead_overlap` + Confidence-Gated Two-Tier)
+    # 3b. Full 20-problem GSM8K at `tlb_slots = 32` (`25%` cache, `~6.2 GB` VRAM!) + Two-Tier Speculative
     for m in moe_layers.values():
-        m.set_tlb_strategy("lookahead_overlap")
+        m.set_tlb_strategy("overlap_shared_mlp")
         m.set_mode("vm_paged", tlb_slots_override=low_vram_slots)
         m.reset_telemetry(clear_tlb=True)
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
-    gen_low_spec = SpeculativeVMGenerator(
+    gen_32_spec = SpeculativeVMGenerator(
         model=model,
         tokenizer=tokenizer,
         phase_b_mlps=moe_layers,
@@ -785,52 +722,31 @@ def stage_bench(args: argparse.Namespace) -> None:
         draft_mode="two_tier",
         max_draft_tokens=3,
         pld_long_draft_tokens=4,
-        confidence_gated_moe=True,
     )
-    print(
-        f"[Phase G GSM8K] Full {len(gsm8k_problems)}-Problem CoT (tlb_slots={low_vram_slots}, Phase G Lookahead + Gated Spec)...",
-        flush=True,
+    print(f"[Phase F GSM8K] Full {len(gsm8k_problems)}-Problem CoT (tlb_slots={low_vram_slots}, ~6.2 GB VRAM, Two-Tier Spec)...", flush=True)
+    res_32_full = _evaluate_gsm8k_speculative(
+        gen_32_spec, gsm8k_problems, max_new_tokens=args.gsm8k_max_tokens, device=args.device, label=f"Slots{low_vram_slots}-Spec"
     )
-    res_low_full = _evaluate_gsm8k_speculative(
-        gen_low_spec,
-        gsm8k_problems,
-        max_new_tokens=args.gsm8k_max_tokens,
-        device=args.device,
-        label=f"Slots{low_vram_slots}-PhaseG",
-    )
-    gsm8k_suite[f"vm_slots_{low_vram_slots}_phase_g_20prob"] = res_low_full
+    gsm8k_suite[f"vm_slots_{low_vram_slots}_two_tier_20prob"] = res_32_full
 
+    # Record M=1 vs Two-Tier 5-problem answer agreement, and hard-assert 0-ulp VM parity across Two-Tier cache sizes!
     m1_vs_spec_ans_agree = 0
     for i5 in range(min(5, len(gsm8k_problems))):
-        p_m1 = gsm8k_suite[f"vm_slots_{low_vram_slots}_m1_lookahead_5prob"]["per_problem"][i5]
-        p_sp = res_low_full["per_problem"][i5]
+        p_m1 = gsm8k_suite[f"vm_slots_{low_vram_slots}_m1_5prob"]["per_problem"][i5]
+        p_sp = res_32_full["per_problem"][i5]
         if p_m1["pred"] == p_sp["pred"]:
             m1_vs_spec_ans_agree += 1
-    gsm8k_suite["m1_vs_phase_g_5prob_answer_agreement"] = f"{m1_vs_spec_ans_agree}/{min(5, len(gsm8k_problems))}"
+    gsm8k_suite["m1_vs_two_tier_5prob_answer_agreement"] = f"{m1_vs_spec_ans_agree}/{min(5, len(gsm8k_problems))}"
 
-    # 3c. Cross-slot 5-problem speed & hard `0-ulp` parity checks across extreme low, default, and ceiling VRAM!
-    check_slots_list: List[Tuple[str, str, int]] = []
-    if pareto_slots and min(pareto_slots) < low_vram_slots:
-        mn_sl = min(pareto_slots)
-        check_slots_list.append((f"vm_slots_{mn_sl}_phase_g_5prob", "vm_paged", mn_sl))
+    # 3c. 5-problem speed check at `tlb_slots = 48` (`~7.8 GB` VRAM) + `all_resident` (`~15.3 GB` VRAM ceiling)
     if args.default_tlb_slots != low_vram_slots:
-        check_slots_list.append(
-            (f"vm_slots_{args.default_tlb_slots}_phase_g_5prob", "vm_paged", args.default_tlb_slots)
-        )
-    if can_fit_all_resident:
-        check_slots_list.append(("all_resident_phase_g_5prob", "all_resident", num_experts_per_layer))
-    elif pareto_slots and max(pareto_slots) > max(low_vram_slots, args.default_tlb_slots):
-        hi_sl = max(pareto_slots)
-        check_slots_list.append((f"vm_slots_{hi_sl}_phase_g_5prob", "vm_paged", hi_sl))
-
-    for suite_key, v_mode, sl_val in check_slots_list:
         for m in moe_layers.values():
-            m.set_tlb_strategy("lookahead_overlap")
-            m.set_mode(v_mode, tlb_slots_override=sl_val)
+            m.set_tlb_strategy("overlap_shared_mlp")
+            m.set_mode("vm_paged", tlb_slots_override=args.default_tlb_slots)
             m.reset_telemetry(clear_tlb=True)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        gen_chk = SpeculativeVMGenerator(
+        gen_def_spec = SpeculativeVMGenerator(
             model=model,
             tokenizer=tokenizer,
             phase_b_mlps=moe_layers,
@@ -838,41 +754,99 @@ def stage_bench(args: argparse.Namespace) -> None:
             draft_mode="two_tier",
             max_draft_tokens=3,
             pld_long_draft_tokens=4,
-            confidence_gated_moe=True,
         )
-        print(f"[Phase G GSM8K] 5-Problem Cross-Slot Speed & 0-ulp Check ({suite_key})...", flush=True)
-        res_chk = _evaluate_gsm8k_speculative(
-            gen_chk,
+        print(f"[Phase F GSM8K] 5-Problem CoT Speed Check (tlb_slots={args.default_tlb_slots}, Two-Tier Spec)...", flush=True)
+        res_def_5 = _evaluate_gsm8k_speculative(
+            gen_def_spec,
             gsm8k_problems[:5],
             max_new_tokens=args.gsm8k_max_tokens,
             device=args.device,
-            label=suite_key,
+            label=f"Slots{args.default_tlb_slots}-Spec",
         )
-        gsm8k_suite[suite_key] = res_chk
+        gsm8k_suite[f"vm_slots_{args.default_tlb_slots}_two_tier_5prob"] = res_def_5
         for i5 in range(min(5, len(gsm8k_problems))):
-            p_ref = res_low_full["per_problem"][i5]
-            p_cur = res_chk["per_problem"][i5]
-            assert p_ref["pred"] == p_cur["pred"] and p_ref["emitted_tokens"] == p_cur["emitted_tokens"], (
-                f"0-ulp VM parity mismatch GSM8K[{i5}] Slots{low_vram_slots} vs {suite_key}: {p_ref} vs {p_cur}"
+            p_32 = res_32_full["per_problem"][i5]
+            p_df = res_def_5["per_problem"][i5]
+            assert p_32["pred"] == p_df["pred"] and p_32["emitted_tokens"] == p_df["emitted_tokens"], (
+                f"0-ulp VM parity mismatch GSM8K[{i5}] Slots32 vs Slots{args.default_tlb_slots}: {p_32} vs {p_df}"
+            )
+
+    if can_fit_all_resident:
+        for m in moe_layers.values():
+            m.set_mode("all_resident")
+            m.reset_telemetry(clear_tlb=True)
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        gen_all_spec = SpeculativeVMGenerator(
+            model=model,
+            tokenizer=tokenizer,
+            phase_b_mlps=moe_layers,
+            draft_head=draft_head,
+            draft_mode="two_tier",
+            max_draft_tokens=3,
+            pld_long_draft_tokens=4,
+        )
+        print("[Phase F GSM8K] 5-Problem All-Resident 0-PCIe Ceiling Check (Two-Tier Spec)...", flush=True)
+        res_all_5 = _evaluate_gsm8k_speculative(
+            gen_all_spec,
+            gsm8k_problems[:5],
+            max_new_tokens=args.gsm8k_max_tokens,
+            device=args.device,
+            label="AllResident-Spec",
+        )
+        gsm8k_suite["all_resident_two_tier_5prob"] = res_all_5
+        for i5 in range(min(5, len(gsm8k_problems))):
+            p_32 = res_32_full["per_problem"][i5]
+            p_al = res_all_5["per_problem"][i5]
+            assert p_32["pred"] == p_al["pred"] and p_32["emitted_tokens"] == p_al["emitted_tokens"], (
+                f"0-ulp VM parity mismatch GSM8K[{i5}] Slots32 vs AllResident: {p_32} vs {p_al}"
+            )
+
+    elif pareto_slots and max(pareto_slots) > max(low_vram_slots, args.default_tlb_slots):
+        hi_slots = max(pareto_slots)
+        for m in moe_layers.values():
+            m.set_tlb_strategy("overlap_shared_mlp")
+            m.set_mode("vm_paged", tlb_slots_override=hi_slots)
+            m.reset_telemetry(clear_tlb=True)
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        gen_hi_spec = SpeculativeVMGenerator(
+            model=model,
+            tokenizer=tokenizer,
+            phase_b_mlps=moe_layers,
+            draft_head=draft_head,
+            draft_mode="two_tier",
+            max_draft_tokens=3,
+            pld_long_draft_tokens=4,
+        )
+        print(f"[Phase F GSM8K] 5-Problem High-TLB Speed Check (tlb_slots={hi_slots}, Two-Tier Spec)...", flush=True)
+        res_hi_5 = _evaluate_gsm8k_speculative(
+            gen_hi_spec,
+            gsm8k_problems[:5],
+            max_new_tokens=args.gsm8k_max_tokens,
+            device=args.device,
+            label=f"Slots{hi_slots}-Spec",
+        )
+        gsm8k_suite[f"vm_slots_{hi_slots}_two_tier_5prob"] = res_hi_5
+        for i5 in range(min(5, len(gsm8k_problems))):
+            p_32 = res_32_full["per_problem"][i5]
+            p_hi = res_hi_5["per_problem"][i5]
+            assert p_32["pred"] == p_hi["pred"] and p_32["emitted_tokens"] == p_hi["emitted_tokens"], (
+                f"0-ulp VM parity mismatch GSM8K[{i5}] Slots{low_vram_slots} vs Slots{hi_slots}: {p_32} vs {p_hi}"
             )
 
     data["hardware"] = {
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
         "cold_boot_s": boot_info["cold_boot_s"],
         "core_only_resident_cuda_mb": core_only_cuda_mb,
-        "core_only_pass_ms": core_pass_telemetry,
         "draft_head_vram_mb": draft_vram_mb,
-        "lookahead_bank_vram_mb": lookahead_vram_mb,
-        "lookahead_pairs_attached": n_attached,
         "baseline_os_ws_mb": ram_base["ws_mb"],
         "baseline_os_commit_mb": ram_base["commit_mb"],
         "boot_os_ws_mb": ram_after_boot["ws_mb"],
         "boot_os_commit_mb": ram_after_boot["commit_mb"],
-        "os_ws_delta_mb": ram_with_heads["ws_mb"] - ram_base["ws_mb"],
+        "os_ws_delta_mb": ram_with_draft["ws_mb"] - ram_base["ws_mb"],
         "host_only_commit_delta_mb": max(
-            0.0,
-            (ram_with_heads["commit_mb"] - ram_base["commit_mb"])
-            - (core_only_cuda_mb + draft_vram_mb + lookahead_vram_mb),
+            0.0, (ram_with_draft["commit_mb"] - ram_base["commit_mb"]) - (core_only_cuda_mb + draft_vram_mb)
         ),
     }
     data["perplexity"] = {
@@ -882,24 +856,28 @@ def stage_bench(args: argparse.Namespace) -> None:
     data["pareto_vram_sweep"] = pareto_results
     data["gsm8k_cot_suite"] = gsm8k_suite
     _save_json(args.out_json, data)
-    print(f"[Phase G Bench] Saved complete telemetry -> {args.out_json}", flush=True)
+    print(f"[Phase F Bench] Saved complete telemetry -> {args.out_json}", flush=True)
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument(
         "--stage",
-        choices=("calibrate_lookahead", "bench", "all"),
+        choices=("teacher_ppl", "offload_ref", "compile", "calibrate", "bench", "all"),
         default="all",
     )
-    p.add_argument("--nvm-dir", default="checkpoints/Qwen3-Next-80B-A3B-Instruct-nvm-moe.nvm")
-    p.add_argument("--out-json", default="checkpoints/phase_g_80b_moe_results.json")
-    p.add_argument("--phase-f-json", default="checkpoints/phase_f_80b_moe_results.json")
-    p.add_argument("--tag", default="qwen3_next_80b_moe")
-    p.add_argument("--default-tlb-slots", type=int, default=96)
-    p.add_argument("--pareto-slots", default="32,64,96,128,192")
-    p.add_argument("--k-pre", type=int, default=0, help="0 = auto-select from model top_k")
-    p.add_argument("--lookahead-kl-steps", type=int, default=60)
+    p.add_argument("--model-id", default="google/gemma-4-26B-A4B-it")
+    p.add_argument("--nvm-dir", default="checkpoints/gemma-4-26B-A4B-it-nvm-moe.nvm")
+    p.add_argument("--out-json", default="checkpoints/phase_f_26b_moe_results.json")
+    p.add_argument("--tag", default="gemma4_26b_moe")
+    p.add_argument("--attn-quant", default="int8")
+    p.add_argument("--shared-mlp-quant", default="int8")
+    p.add_argument("--lm-head-quant", default="none")
+    p.add_argument("--expert-group-size", type=int, default=64)
+    p.add_argument("--default-tlb-slots", type=int, default=48)
+    p.add_argument("--pareto-slots", default="16,32,48,64")
+    p.add_argument("--offload-gpu-layers", type=int, default=12)
+    p.add_argument("--eagle-epochs", type=int, default=40)
     p.add_argument("--eval-decode-tokens", type=int, default=64)
     p.add_argument("--gsm8k-count", type=int, default=20)
     p.add_argument("--gsm8k-max-tokens", type=int, default=320)
@@ -908,29 +886,37 @@ def main() -> None:
     args = p.parse_args()
 
     if args.stage == "all":
-        for sub_stage in ("calibrate_lookahead", "bench"):
-            print(f"\n==================== PHASE G STAGE: {sub_stage} ====================", flush=True)
+        for sub_stage in ("teacher_ppl", "offload_ref", "compile", "calibrate", "bench"):
+            print(f"\n==================== PHASE F STAGE: {sub_stage} ====================", flush=True)
             cmd = [
                 sys.executable,
                 os.path.abspath(__file__),
                 "--stage",
                 sub_stage,
+                "--model-id",
+                args.model_id,
                 "--nvm-dir",
                 args.nvm_dir,
                 "--out-json",
                 args.out_json,
-                "--phase-f-json",
-                args.phase_f_json,
                 "--tag",
                 args.tag,
+                "--attn-quant",
+                args.attn_quant,
+                "--shared-mlp-quant",
+                args.shared_mlp_quant,
+                "--lm-head-quant",
+                args.lm_head_quant,
+                "--expert-group-size",
+                str(args.expert_group_size),
                 "--default-tlb-slots",
                 str(args.default_tlb_slots),
                 "--pareto-slots",
                 args.pareto_slots,
-                "--k-pre",
-                str(args.k_pre),
-                "--lookahead-kl-steps",
-                str(args.lookahead_kl_steps),
+                "--offload-gpu-layers",
+                str(args.offload_gpu_layers),
+                "--eagle-epochs",
+                str(args.eagle_epochs),
                 "--eval-decode-tokens",
                 str(args.eval_decode_tokens),
                 "--gsm8k-count",
@@ -945,8 +931,14 @@ def main() -> None:
             subprocess.run(cmd, check=True)
         return
 
-    if args.stage == "calibrate_lookahead":
-        stage_calibrate_lookahead(args)
+    if args.stage == "teacher_ppl":
+        stage_teacher_ppl(args)
+    elif args.stage == "offload_ref":
+        stage_offload_ref(args)
+    elif args.stage == "compile":
+        stage_compile(args)
+    elif args.stage == "calibrate":
+        stage_calibrate(args)
     elif args.stage == "bench":
         stage_bench(args)
 

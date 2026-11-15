@@ -1,3 +1,7 @@
+import os as _os, sys as _sys
+_REPO_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
 """End-to-end execution script and benchmark evaluator for the Neural VM Single-Layer PoC.
 
 Evaluates three execution states on held-out slices (Logic_Eval and Fact_Eval):

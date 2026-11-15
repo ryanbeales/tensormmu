@@ -1,3 +1,7 @@
+import os as _os, sys as _sys
+_REPO_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
 """Phase 5 End-to-End Driver: Cross-Model Subspace Alignment & Teacher-to-Student Knowledge Cartridges.
 
 Proves that the 3.53 GB Neural VM (`google/gemma-4-E2B-it` Student W_CPU + Procrustes-Aligned Teacher INT8 W_RAM Cartridges)

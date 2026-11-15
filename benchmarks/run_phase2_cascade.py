@@ -1,3 +1,7 @@
+import os as _os, sys as _sys
+_REPO_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
 """Phase 2 End-to-End Driver: 16-Layer Sequential Decompilation & Async Prefetching MMU.
 
 Evaluates 4 states across Layers L in [10, 25] of `google/gemma-4-E2B-it`:

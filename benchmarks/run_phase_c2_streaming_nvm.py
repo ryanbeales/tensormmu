@@ -1,3 +1,7 @@
+import os as _os, sys as _sys
+_REPO_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
 """Phase C2 Driver: Streaming Layer-by-Layer `.safetensors` Compiler & `.nvm` Cold-Boot Benchmark.
 
 Proves the complete zero-monolithic Phase C2 pipeline on `google/gemma-4-E4B-it` (and scales directly

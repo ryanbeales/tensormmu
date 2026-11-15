@@ -190,6 +190,7 @@ TensorMMU sits directly alongside recent architectural work from **Google** and 
 - `runtime/` — NVRTC CUDA MoE-TLB & Zero-Copy kernels (`moe_tlb_kernels.py`), 3-tier TLB cache manager (`moe_expert_tlb.py`), growable Full/Piecewise CUDA Graph decode runner (`cuda_graph_decode.py`), GatedDeltaNet fused kernels (`qwen3_next_kernels.py`), speculative decoding (`speculative_vm.py`), and HTTP/SSE server (`openai_server.py`).
 - `decompiler/` — `O(1)`-VRAM single-layer streaming `.safetensors -> .tmmu/.nvm` serializer (`nvm_serializer.py`).
 - `docs/index.html` — Standalone technical explanation website (also served at `GET /about`).
+- `benchmarks/` — Historical Phase 1–H research & benchmark reproduction scripts plus archived RTX 4090 JSON telemetry (`benchmarks/results/`).
 - `Dockerfile`, `docker-compose.yml`, `deploy/k8s-deployment.yaml` — Container & Kubernetes deployment manifests.
 
 ## License

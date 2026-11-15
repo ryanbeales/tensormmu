@@ -40,4 +40,4 @@ tensormmu = "tensormmu.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["tensormmu*", "runtime*", "decompiler*", "data*", "eval*", "models*"]
+include = ["tensormmu*", "runtime*", "decompiler*", "data*"]
