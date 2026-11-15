@@ -1,0 +1,137 @@
+{
+  "model_id": "google/gemma-4-31B-it",
+  "checkpoint_info": {
+    "total_parameters": 32682372656,
+    "full_bf16_mb": 59648.6833114624,
+    "text_bf16_mb": 58550.53966522217
+  },
+  "dense_bf16_teacher": {
+    "wall_s": 60.26815329999954,
+    "peak_vram_mb": 3641.90234375,
+    "logic_loss": 4.050253288418639,
+    "logic_ppl": 57.41199699789818,
+    "logic_acc_pct": 57.40196078431372,
+    "fact_loss": 6.947685795204312,
+    "fact_ppl": 1040.738457240253,
+    "fact_acc_pct": 33.55392156862745
+  },
+  "layer_offload_bf16": {
+    "num_gpu_layers": 18,
+    "num_offloaded_layers": 42,
+    "resident_cuda_mb": 19457.9267578125,
+    "peak_cuda_mb": 20568.55859375,
+    "decode_ms_per_tok": 24954.978483333736,
+    "decode_tok_per_s": 0.0400721643846679,
+    "pcie_mb_per_token": 39103.77058792114
+  },
+  "uniform_int4": {
+    "compile_telemetry": {
+      "compile_wall_s": 55.04811239999981,
+      "peak_preamble_vram_mb": 2696.138671875,
+      "peak_single_layer_vram_mb": 2281.61572265625,
+      "peak_compile_vram_mb": 2696.138671875,
+      "total_disk_mb": 18432.020122528076,
+      "core_resident_disk_mb": 18432.020122528076,
+      "pages_disk_mb": 0.0,
+      "ple_disk_mb": 0.0
+    },
+    "cold_boot_s": 15.29564720000053,
+    "cuda_allocated_mb": 18695.01953125,
+    "logic_ppl": 73.44007385729236,
+    "fact_ppl": 1316.483133290676,
+    "decode_ms": 137.18530312507937,
+    "decode_tps": 7.289410579850854,
+    "gsm_ok": 19,
+    "gsm_acc": 95.0,
+    "gsm_sample_trace": "`...l: 16 - 7 = 9 6. Price per egg: $2 7. Total daily earnings: 9 eggs  $2/egg = $18  #### 18` -> Extracted: `18` (Gold: `18`)"
+  },
+  "neuralvm": {
+    "compile_telemetry": {
+      "compile_wall_s": 475.66615589999856,
+      "peak_preamble_vram_mb": 2724.1748046875,
+      "peak_single_layer_vram_mb": 10205.23291015625,
+      "peak_compile_vram_mb": 10205.23291015625,
+      "total_disk_mb": 27246.647693634033,
+      "core_resident_disk_mb": 18977.892993927002,
+      "pages_disk_mb": 8268.754699707031,
+      "ple_disk_mb": 0.0
+    },
+    "avg_core_rel_err": 0.1940890657050269,
+    "avg_tlb_rel_err": 0.1919388570157545,
+    "pinned_cold_boot": {
+      "cold_boot_s": 23.121559400002297,
+      "mode": "vm_paged",
+      "tlb_strategy": "speculative_tlb",
+      "page_storage": "pinned_ram",
+      "cuda_allocated_mb": 19859.21240234375,
+      "cuda_peak_mb": 19859.21240234375,
+      "ram_before": {
+        "ws_mb": 751.6953125,
+        "peak_ws_mb": 1031.921875,
+        "commit_mb": 1621.48828125,
+        "peak_commit_mb": 1886.28125
+      },
+      "ram_after": {
+        "ws_mb": 15328.80078125,
+        "peak_ws_mb": 18888.0390625,
+        "commit_mb": 36978.3671875,
+        "peak_commit_mb": 40565.75390625
+      },
+      "ws_delta_mb": 14577.10546875,
+      "ram_commit_delta_mb": 35356.87890625,
+      "host_only_commit_delta_mb": 15497.66650390625
+    },
+    "core_only": {
+      "cuda_allocated_mb": 19176.20654296875,
+      "logic_ppl": 64.55605231221034,
+      "fact_ppl": 1212.8184753046603,
+      "decode_ms": 132.50535468750968,
+      "decode_tps": 7.546864821865669,
+      "gsm_ok": 18,
+      "gsm_acc": 90.0,
+      "gsm_sample_trace": "`.... Eggs remaining to sell: 16 - 7 = 9 6. Total earnings: 9 eggs  $2 per egg = $18  #### 18` -> Extracted: `18` (Gold: `18`)"
+    },
+    "vm_pinned": {
+      "cuda_allocated_mb": 19859.21240234375,
+      "logic_ppl": 66.4907420385312,
+      "fact_ppl": 1198.3087236291205,
+      "spec_decode_ms": 234.11301093744896,
+      "spec_decode_tps": 4.271441369258982,
+      "tlb_hit_pct": 38.91014739229025,
+      "pcie_mb_per_tok": 207.1849822998047,
+      "gsm_ok": 18,
+      "gsm_acc": 90.0,
+      "gsm_sample_trace": "`...ggs remaining to be sold: 16 - 7 = 9 6. Total earnings: 9 eggs  $2 per egg = $18  #### 18` -> Extracted: `18` (Gold: `18`)"
+    },
+    "vm_nvme_mmap": {
+      "cold_boot_s": 17.333680900002946,
+      "mode": "vm_paged",
+      "tlb_strategy": "speculative_tlb",
+      "page_storage": "nvme_mmap",
+      "cuda_allocated_mb": 19859.21240234375,
+      "cuda_peak_mb": 19859.21240234375,
+      "ram_before": {
+        "ws_mb": 753.39453125,
+        "peak_ws_mb": 1033.0390625,
+        "commit_mb": 1623.59765625,
+        "peak_commit_mb": 1887.7734375
+      },
+      "ram_after": {
+        "ws_mb": 994.91015625,
+        "peak_ws_mb": 4553.96484375,
+        "commit_mb": 22633.15625,
+        "peak_commit_mb": 26220.3671875
+      },
+      "ws_delta_mb": 241.515625,
+      "ram_commit_delta_mb": 21009.55859375,
+      "host_only_commit_delta_mb": 1150.34619140625,
+      "logic_ppl": 66.4907420385312,
+      "fact_ppl": 1198.3087236291205,
+      "spec_decode_ms": 231.40892812500624,
+      "spec_decode_tps": 4.321354444284033,
+      "tlb_hit_pct": 38.91014739229025,
+      "pcie_mb_per_tok": 207.1849822998047
+    }
+  },
+  "wall_s": 1756.131724400002
+}

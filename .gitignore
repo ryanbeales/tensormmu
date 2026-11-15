@@ -1,0 +1,29 @@
+# Python & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Model checkpoints, cartridges & Hugging Face caches
+checkpoints/*.nvm/
+checkpoints/*.tmmu/
+checkpoints/*.safetensors
+checkpoints/*.pt
+checkpoints/*.bin
+hf_cache/
+
+# IDE & OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Scratch & temporary files
+tmp/
+*.log

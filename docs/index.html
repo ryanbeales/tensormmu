@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TensorMMU — GPU Virtual Memory, TLB & Tiered Caching for Sparse-MoE LLMs</title>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --panel: #121722;
+    --panel-alt: #161d2b;
+    --border: #232d42;
+    --text: #e6edf3;
+    --muted: #8b98ad;
+    --accent: #38bdf8;
+    --accent-soft: rgba(56, 189, 248, 0.12);
+    --green: #34d399;
+    --amber: #fbbf24;
+    --rose: #fb7185;
+    --purple: #a78bfa;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    --sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: radial-gradient(circle at 50% -10%, #17233a 0%, var(--bg) 48%);
+    color: var(--text);
+    font-family: var(--sans);
+    line-height: 1.62;
+    font-size: 16px;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px 80px; }
+  nav {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 20px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; gap: 12px;
+  }
+  .brand { font-weight: 800; font-size: 19px; letter-spacing: -0.02em; display: flex; align-items: center; gap: 10px; }
+  .chip {
+    font-family: var(--mono); font-size: 11px; padding: 3px 8px; border-radius: 999px;
+    background: var(--accent-soft); color: var(--accent); border: 1px solid rgba(56, 189, 248, 0.3);
+  }
+  .nav-links { display: flex; gap: 18px; font-size: 14px; color: var(--muted); flex-wrap: wrap; }
+  .nav-links a { color: var(--muted); }
+  .nav-links a:hover { color: var(--text); text-decoration: none; }
+  header.hero { padding: 56px 0 36px; }
+  h1 {
+    font-size: clamp(32px, 4.6vw, 50px);
+    line-height: 1.12;
+    letter-spacing: -0.03em;
+    margin: 14px 0 18px;
+  }
+  .lead { font-size: 19px; color: #b8c4d6; max-width: 840px; margin: 0 0 28px; }
+  .stat-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 14px; margin: 28px 0 12px;
+  }
+  .stat-card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px;
+  }
+  .stat-card .k { font-family: var(--mono); font-size: 28px; font-weight: 700; color: var(--text); }
+  .stat-card .k span { font-size: 15px; color: var(--accent); font-weight: 600; }
+  .stat-card .lbl { font-size: 13px; color: var(--muted); margin-top: 4px; }
+  section { margin-top: 52px; }
+  h2 {
+    font-size: 25px; letter-spacing: -0.02em; margin: 0 0 14px;
+    padding-bottom: 10px; border-bottom: 1px solid var(--border);
+  }
+  h3 { font-size: 18px; margin: 24px 0 8px; color: #f0f6fc; }
+  p { margin: 0 0 14px; color: #c8d2e1; }
+  code {
+    font-family: var(--mono); font-size: 0.9em; background: #192233;
+    padding: 2px 6px; border-radius: 5px; color: #e2e8f0;
+  }
+  pre {
+    background: #0d121c; border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px 18px; overflow-x: auto; font-family: var(--mono); font-size: 13.5px;
+    line-height: 1.52; color: #dbe7f5; margin: 12px 0 20px;
+  }
+  .mmu-diagram {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    gap: 14px; margin: 20px 0;
+  }
+  .tier {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 18px; position: relative;
+  }
+  .tier.l1 { border-top: 3px solid var(--green); }
+  .tier.l2 { border-top: 3px solid var(--accent); }
+  .tier.l3 { border-top: 3px solid var(--purple); }
+  .tier.ctrl { border-top: 3px solid var(--amber); }
+  .tier-tag {
+    font-family: var(--mono); font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--muted);
+  }
+  .tier h4 { margin: 6px 0 8px; font-size: 17px; }
+  .tier .bw { font-family: var(--mono); font-size: 13px; color: var(--accent); margin-bottom: 8px; }
+  .tier p { font-size: 13.5px; color: var(--muted); margin: 0; }
+  table {
+    width: 100%; border-collapse: collapse; margin: 16px 0 24px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+    font-size: 14px;
+  }
+  th, td { padding: 11px 14px; text-align: left; border-bottom: 1px solid var(--border); }
+  th { background: var(--panel-alt); color: #cbd5e1; font-weight: 600; font-size: 12.5px; text-transform: uppercase; letter-spacing: 0.04em; }
+  tr:last-child td { border-bottom: none; }
+  .good { color: var(--green); font-weight: 600; font-family: var(--mono); }
+  .warn { color: var(--amber); font-family: var(--mono); }
+  .callout {
+    background: var(--panel-alt); border-left: 4px solid var(--accent);
+    padding: 16px 20px; border-radius: 0 10px 10px 0; margin: 18px 0;
+  }
+  .callout.honest { border-left-color: var(--amber); }
+  .callout strong { color: #fff; }
+  .tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+  .tab-btn {
+    background: var(--panel); border: 1px solid var(--border); color: var(--muted);
+    padding: 7px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; font-family: var(--mono);
+  }
+  .tab-btn.active { background: var(--accent-soft); color: var(--accent); border-color: rgba(56, 189, 248, 0.45); }
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
+  footer {
+    margin-top: 64px; padding-top: 24px; border-top: 1px solid var(--border);
+    color: var(--muted); font-size: 13px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav>
+    <div class="brand">
+      <span>TensorMMU</span>
+      <span class="chip">v0.1 PoC · Linux &amp; Windows · NVIDIA sm_80+</span>
+    </div>
+    <div class="nav-links">
+      <a href="#architecture">MMU Architecture</a>
+      <a href="#benchmarks">RTX 4090 Benchmarks</a>
+      <a href="#honest-findings">Dense vs Sparse MoE</a>
+      <a href="#agents">Coding Agent Tuning</a>
+      <a href="#deploy">Docker, K8s &amp; AWS</a>
+      <a href="/">Live Playground</a>
+    </div>
+  </nav>
+
+  <header class="hero">
+    <span class="chip">Computer Architecture Applied to LLM Weights</span>
+    <h1>Treat 80B+ Sparse-MoE Weights Like Virtual Memory, Not Static Allocations.</h1>
+    <p class="lead">
+      Modern operating systems never require an entire program to fit in L1/L2 SRAM before running an instruction.
+      <strong>TensorMMU</strong> brings hardware virtual memory — GPU Translation Lookaside Buffers (TLBs),
+      L1 VRAM hot caches, L2 zero-copy pinned DDR5, and L3 NVMe DMA rings — to Sparse Mixture-of-Experts LLMs,
+      serving OpenAI and Anthropic coding agents with full tool calling on a single 24&nbsp;GB GPU or scaling to
+      all-resident HBM on AWS H100/H200 instances.
+    </p>
+
+    <div class="stat-grid">
+      <div class="stat-card">
+        <div class="k">28.4 – 34.5 <span>tok/s</span></div>
+        <div class="lbl">Qwen3-Next-80B-A3B (44 GB) on 1× RTX 4090 (18.8 GB VRAM, 100% GSM8K)</div>
+      </div>
+      <div class="stat-card">
+        <div class="k">49.1 – 55.2 <span>tok/s</span></div>
+        <div class="lbl">Gemma-4-26B-A4B (15.3 GB) at just 8.15 GB VRAM via L1 TLB + L2 Zero-Copy</div>
+      </div>
+      <div class="stat-card">
+        <div class="k">&lt; 4.8 <span>GiB</span></div>
+        <div class="lbl">Peak GPU VRAM to stream-compile an 80B BF16 checkpoint layer-by-layer</div>
+      </div>
+      <div class="stat-card">
+        <div class="k">32,768 <span>tok</span></div>
+        <div class="lbl">Default agent output window + 6,144 thinking cap &amp; O(1)-VRAM growable KV cache</div>
+      </div>
+    </div>
+  </header>
+
+  <section id="architecture">
+    <h2>1. How TensorMMU Maps Computer Architecture to Transformers</h2>
+    <p>
+      In Sparse-MoE models like <code>Qwen3-Next-80B-A3B</code> (512 experts/layer, top-10 active = <strong>1.95%</strong> per token)
+      and <code>Gemma-4-26B-A4B</code> (128 experts/layer, top-8 active = <strong>6.25%</strong> per token), over 90% of model bytes
+      live in routed expert FFN matrices that are untouched on any single token. Instead of splitting layers across CPU PyTorch
+      threads or failing with <code>CUDA out of memory</code>, TensorMMU compiles every expert into a <strong>4&nbsp;KB-aligned
+      contiguous <code>UINT4</code> virtual memory page</strong> and manages residency through a 3-tier hardware cache hierarchy:
+    </p>
+
+    <div class="mmu-diagram">
+      <div class="tier ctrl">
+        <div class="tier-tag">MMU + Page Table</div>
+        <h4>GPU Slot Table &amp; LRU/LFU TLB</h4>
+        <div class="bw">Device-Side Lookup · CUDA Graph Safe</div>
+        <p>Maps virtual <code>(layer, expert_id)</code> addresses to L1 VRAM slots or L2 Zero-Copy host pointers directly inside fused NVRTC CUDA kernels.</p>
+      </div>
+      <div class="tier l1">
+        <div class="tier-tag">Tier 1 · Hot Cache</div>
+        <h4>L1 GPU HBM / GDDR6X</h4>
+        <div class="bw">~1,008 GB/s (RTX 4090) · 3.35 TB/s (H100)</div>
+        <p>Holds the always-active trunk (embeddings, quantized attention/GDN, shared MLP) plus the hottest <code>K</code> expert pages per layer.</p>
+      </div>
+      <div class="tier l2">
+        <div class="tier-tag">Tier 2 · Warm Cache</div>
+        <h4>L2 Zero-Copy Pinned DDR5</h4>
+        <div class="bw">~15.9 GB/s PCIe 4.0 x16 Direct Read</div>
+        <p><code>cudaHostAllocMapped</code> pinned pages read directly over PCIe by idle SMs on L1 TLB misses — zero CPU intervention, 100% capturable in a single Full CUDA Graph.</p>
+      </div>
+      <div class="tier l3">
+        <div class="tier-tag">Tier 3 · Backing Store</div>
+        <h4>L3 NVMe Pinned DMA Ring</h4>
+        <div class="bw">32-Slot Async H2D Staging (~22.9 GB/s)</div>
+        <p>For 80B+ models exceeding DDR5 RAM, unmapped misses stream from 4&nbsp;KB-aligned <code>.safetensors</code> shards while Shared-MLP &amp; Attention segments replay inside Piecewise CUDA Graphs.</p>
+      </div>
+    </div>
+
+    <div class="callout">
+      <strong>Intra-Layer Shared-MLP DMA Overlap &amp; Cross-Layer Lookahead Prefetch:</strong>
+      When an L3 page fault occurs, TensorMMU launches the async PCIe H2D DMA transfer on a dedicated non-blocking stream
+      <em>before</em> running the layer's Shared Expert / Dense branch, hiding PCIe latency behind compute. Optional
+      <code>INT8</code> Cross-Layer Lookahead Routers predict layer <code>l+1</code>'s top experts from layer <code>l</code>'s residual stream.
+    </div>
+  </section>
+
+  <section id="benchmarks">
+    <h2>2. Measured Benchmarks (Single Consumer RTX 4090 24 GB + 32 GB DDR5)</h2>
+    <p>
+      All figures below are end-to-end wall-clock measurements on Windows 11 with a single 24&nbsp;GB NVIDIA RTX 4090
+      (PCIe 4.0 x16, 32&nbsp;GB DDR5), including prefill/decode KV management and zero test-split calibration leakage:
+    </p>
+    <table>
+      <thead>
+        <tr>
+          <th>Model</th>
+          <th>Total / Active Params</th>
+          <th>Execution &amp; Tiering Mode</th>
+          <th>Allocated VRAM</th>
+          <th>TTFT (Prefill)</th>
+          <th>Decode Speed</th>
+          <th>GSM8K CoT</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>Gemma-4-26B-A4B-it</code></td>
+          <td>26B / 3.8B (128E top-8)</td>
+          <td><code>vm_paged</code> (48 L1 + 80 L2 Zero-Copy, Piecewise Graph + Spec)</td>
+          <td class="good">8.15 GiB</td>
+          <td>523 ms</td>
+          <td class="good">49.1 – 55.2 tok/s</td>
+          <td>100%</td>
+        </tr>
+        <tr>
+          <td><code>Gemma-4-26B-A4B-it</code></td>
+          <td>26B / 3.8B (128E top-8)</td>
+          <td><code>vm_paged</code> (48 L1 + 80 L2 Zero-Copy, Single Full CUDA Graph)</td>
+          <td class="good">8.15 GiB</td>
+          <td>523 ms</td>
+          <td class="good">46.3 tok/s</td>
+          <td>100%</td>
+        </tr>
+        <tr>
+          <td><code>Qwen3-Next-80B-A3B</code></td>
+          <td>80B / 3.0B (512E top-10)</td>
+          <td><code>vm_paged</code> (192 L1 + 213 L2 + 107 L3 NVMe, Piecewise Graph)</td>
+          <td class="good">18.80 GiB</td>
+          <td>4.54 s</td>
+          <td class="good">28.4 tok/s (34.5 peak)</td>
+          <td>100%</td>
+        </tr>
+        <tr>
+          <td><code>Qwen3-Next-80B-A3B</code></td>
+          <td>80B / 3.0B (512E top-10)</td>
+          <td>Naive BF16 Layer Offloading Baseline</td>
+          <td class="warn">22.40 GiB</td>
+          <td>14.2 s</td>
+          <td class="warn">0.38 tok/s</td>
+          <td>100%</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      <strong>Portability across NVIDIA GPUs:</strong> TensorMMU's NVRTC kernels use standard warp shuffle reductions and
+      vectorized <code>uint4</code> (128-bit) loads without Ada-locked PTX instructions — running unmodified across
+      <strong>Ampere (`sm_80`/`sm_86`: A10G, A100, RTX 3090)</strong>, <strong>Ada (`sm_89`: L4, L40S, RTX 4090)</strong>,
+      <strong>Hopper (`sm_90`: H100, H200)</strong>, and <strong>Blackwell (`sm_100`/`sm_120`)</strong>. On 80&nbsp;GB+ AWS
+      instances (`p4d` / `p5`), TensorMMU's hardware check automatically promotes 80B cartridges to <code>all_resident</code>
+      + <code>full_graph</code> mode with zero PCIe traffic!
+    </p>
+  </section>
+
+  <section id="honest-findings">
+    <h2>3. Scientific Honesty, Alternatives &amp; Google / DeepSeek Lineage</h2>
+    <div class="callout honest">
+      <strong>Why We Renamed from <code>NeuralVM</code> to <code>TensorMMU</code> (Negative Result Preserved):</strong>
+      This project started as <em>NeuralVM</em> to test decompiling <em>dense</em> 31B FFNs into SVD hot trunks + paged cold neuron slices.
+      Because dense SwiGLU layers activate 100% of intermediate channels on every token, paging dense weights either stalls on PCIe
+      bandwidth or degrades reasoning perplexity when cold pages are dropped. <strong>Virtual memory requires locality</strong> — and
+      native Sparse-MoE routing (<code>1.95%–6.25%</code> active bytes/token) plus token-indexed lookup layers provide exact, lossless sparsity.
+    </div>
+    <p>
+      <strong>Connection to Google &amp; DeepSeek Memory Architectures:</strong> TensorMMU complements hardware-aware model designs from
+      <strong>DeepSeek's <em>Engram</em></strong> (<em>Conditional Memory via Scalable Lookup</em>, which offloads massive deterministic <code>O(1)</code>
+      N-gram tables to host DRAM over PCIe) and <strong>Google's <em>Per-Layer Embeddings (PLE)</em> &amp; <em>Titans</em></strong> (per-layer
+      host-offloadable token lookup tables — supported natively in TensorMMU via <code>ple_host.safetensors</code> — and adaptive neural memory).
+    </p>
+    <p>
+      <strong>How TensorMMU Compares to Alternatives:</strong>
+    </p>
+    <ul>
+      <li>
+        <strong><a href="https://github.com/JustVugg/colibri" target="_blank" rel="noopener">Colibrì (<code>JustVugg/colibri</code>)</a>:</strong>
+        Pure-C hierarchical <code>NVMe → RAM → GPU</code> MoE engine using raw async C file I/O and <code>.coli_usage</code> hot-store pinning.
+        Colibrì is purpose-built for streaming ultra-giant <code>400B–744B</code> MoEs (<code>GLM-5</code>, <code>DeepSeek-V3</code>) from NVMe on modest rigs,
+        whereas TensorMMU targets higher single-GPU decode throughput (<code>28–55 tok/s</code>) and full OpenAI/Anthropic tool-calling in the
+        <code>26B–120B+</code> regime via L2 Zero-Copy mapped PCIe reads and Full/Piecewise CUDA Graphs.
+      </li>
+      <li>
+        <strong><code>llama.cpp</code> &amp; <code>KTransformers</code>:</strong> Execute offloaded MoE experts on <em>host CPU cores</em>
+        (<code>AVX-512</code> / <code>AMX</code>). Ideal for 8–12 channel DDR5 Xeon/EPYC servers; TensorMMU instead pages/maps cold experts directly
+        into NVIDIA GPU SMs so standard 2-channel DDR5 desktops aren't bottlenecked by CPU compute.
+      </li>
+      <li>
+        <strong>Unified-Memory Servers (<code>Halogen Flash Server</code>, <code>MLX</code>):</strong> Hit <code>~37–45+ tok/s</code> when 100% of an
+        80B MoE fits in <code>128 GB+</code> unified memory (Strix Halo / M-Ultra) with no PCIe bus; TensorMMU bridges discrete NVIDIA GPUs across VRAM, DDR5, and NVMe.
+      </li>
+    </ul>
+  </section>
+
+  <section id="agents">
+    <h2>4. Built for Autonomous Coding Agents (OpenAI + Anthropic + Tool Calling)</h2>
+    <p>
+      Local coding agents frequently fail not because of model intelligence, but because of subtle server defaults
+      (as documented in <a href="https://doug.sh/posts/tuning-a-local-coding-agent-oh-my-pi/" target="_blank" rel="noopener">Doug's guide on tuning local coding agents</a>):
+    </p>
+    <ul>
+      <li>
+        <strong>No More Mid-File Tool Call Truncation (`max_tokens = 32,768` + `thinking_token_budget = 6,144`):</strong>
+        In both OpenAI and Anthropic protocols, <code>max_tokens</code> caps <em>reasoning + visible text + tool-call JSON combined</em>.
+        With an 8,192 default, a 6,000-token thinking trace leaves ~2,100 tokens — slicing a 300-line <code>write_file</code> tool call in half!
+        TensorMMU defaults <code>max_tokens</code> to <strong>32,768</strong> while enforcing an automatic <strong>6,144-token thinking cap</strong>
+        (injecting <code>&lt;/think&gt;</code> or <code>&lt;channel|&gt;</code> cleanly when reached so 26,000+ tokens remain for code output).
+      </li>
+      <li>
+        <strong>O(1)-Overhead Growable Static KV Cache:</strong>
+        Pre-allocating 32,768 KV slots upfront would waste 7.3&nbsp;GiB of VRAM on short turns. TensorMMU's CUDA-graphed KV pool starts compact
+        (<code>max(4096, prompt + 2048)</code>, &lt; 900&nbsp;MiB) and grows layer-by-layer (<code>4K → 8K → 16K → 32K</code>) only when a turn actually runs long.
+      </li>
+      <li>
+        <strong>Native Dual-Protocol Tool Calling:</strong>
+        Parses both Qwen3 XML/JSON <code>&lt;tool_call&gt;</code> blocks and Gemma 4's typed <code>&lt;|tool_call&gt;call:fn{...}&lt;tool_call|&gt;</code>
+        syntax into structured OpenAI <code>tool_calls</code> and Anthropic <code>tool_use</code> / <code>input_json_delta</code> SSE events, while
+        automatically normalizing multi-turn <code>tool_result</code> histories.
+      </li>
+    </ul>
+
+    <div class="tabs">
+      <button class="tab-btn active" onclick="showTab('claude')">Claude Code (Anthropic API)</button>
+      <button class="tab-btn" onclick="showTab('omp')">Oh My Pi / OpenAI Agents</button>
+      <button class="tab-btn" onclick="showTab('python')">Python Tool Calling</button>
+    </div>
+
+    <div id="tab-claude" class="tab-pane active">
+<pre># Point Claude Code or any Anthropic SDK client directly at TensorMMU:
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8000"
+export ANTHROPIC_API_KEY="tmmu-local"
+
+claude --model Qwen3-Next-80B-A3B-Instruct-nvm-moe</pre>
+    </div>
+    <div id="tab-omp" class="tab-pane">
+<pre># ~/.omp/agent/models.json (following doug.sh tuning recommendations)
+{
+  "providers": {
+    "tensormmu": {
+      "baseUrl": "http://127.0.0.1:8000/v1",
+      "apiKey": "tmmu-local",
+      "api": "openai-completions",
+      "models": [
+        {
+          "id": "Qwen3-Next-80B-A3B-Instruct-nvm-moe",
+          "name": "Qwen3-Next 80B (TensorMMU)",
+          "reasoning": true,
+          "contextWindow": 65536,
+          "maxTokens": 32768
+        }
+      ]
+    }
+  }
+}</pre>
+    </div>
+    <div id="tab-python" class="tab-pane">
+<pre>import anthropic
+
+client = anthropic.Anthropic(base_url="http://127.0.0.1:8000", api_key="local")
+msg = client.messages.create(
+    model="gemma-4-26B-A4B-it-nvm-moe",
+    max_tokens=32768,
+    thinking={"type": "enabled", "budget_tokens": 4096},
+    tools=[{
+        "name": "read_file",
+        "description": "Read a UTF-8 file from disk",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        }
+    }],
+    messages=[{"role": "user", "content": "Inspect pyproject.toml first."}],
+)
+print(msg.content)</pre>
+    </div>
+  </section>
+
+  <section id="deploy">
+    <h2>5. Hardware Safety, Docker, Kubernetes &amp; AWS Scaling</h2>
+    <p>
+      Before downloading or loading a model, <code>tmmu check</code> (and <code>tmmu serve</code> automatically) inspects
+      GPU compute capability (blocking unsupported pre-Ampere GPUs like AWS <code>g4dn</code> Turing T4 <code>sm_75</code> with a clear diagnostic),
+      free VRAM, Linux cgroup v1/v2 container memory limits, <code>/dev/shm</code> capacity, and free disk space.
+    </p>
+<pre># 1. Check if a model fits your GPU before downloading a single weight shard:
+tmmu check Qwen/Qwen3-Next-80B-A3B-Instruct
+
+# 2. Compile &amp; serve locally via Python CLI:
+tmmu compile google/gemma-4-26B-A4B-it
+tmmu serve --model google/gemma-4-26B-A4B-it --port 8000
+
+# 3. Or launch with Docker — HTTP binds immediately!
+#    GET /livez  -> 200 OK
+#    GET /readyz -> 503 Service Unavailable (while downloading &amp; stream-compiling) -> 200 OK when ready
+#    POST /v1/messages &amp; /v1/chat/completions -> 503 (Retry-After: 10) until ready
+docker compose up --build</pre>
+
+    <h3>Recommended AWS GPU Instance Matrix</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>AWS Instance</th>
+          <th>NVIDIA GPU</th>
+          <th>VRAM + Host RAM</th>
+          <th>TensorMMU Auto-Selected Mode</th>
+          <th>Sweet-Spot Models</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>g5.2xlarge</code> / <code>g6.2xlarge</code></td>
+          <td>1× A10G / L4 (24 GB)</td>
+          <td>24 GiB + 32 GiB</td>
+          <td><code>vm_paged</code> (L1 + L2 Zero-Copy + L3 NVMe)</td>
+          <td>Gemma-4-26B-A4B, Qwen3-Next-80B-A3B</td>
+        </tr>
+        <tr>
+          <td><code>g6e.2xlarge</code> / <code>g6e.4xlarge</code></td>
+          <td>1× L40S (48 GB)</td>
+          <td>48 GiB + 64–128 GiB</td>
+          <td><code>all_resident</code> (26B) / High-L1 + Full Zero-Copy (80B)</td>
+          <td>Qwen3-Next-80B-A3B (100% L1+L2 Full CUDA Graph!), Mixtral 8x22B</td>
+        </tr>
+        <tr>
+          <td><code>p4d.24xlarge</code> / <code>p5.48xlarge</code></td>
+          <td>A100 80 GB / H100 80 GB / H200 141 GB</td>
+          <td>80–141 GiB HBM3/e</td>
+          <td><code>all_resident</code> (80B in HBM) or <code>vm_paged</code> (235B–400B+ MoE!)</td>
+          <td>Qwen3-Next-80B all-resident, Qwen3-235B-A22B, DeepSeek-V3 class MoEs</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <footer>
+    <div>TensorMMU · MIT License · Linux &amp; Windows · NVIDIA GPUs (<code>sm_80+</code>)</div>
+    <div><a id="footer-cta" href="/">Open Live Server Playground →</a></div>
+  </footer>
+</div>
+
+<script>
+function showTab(name) {
+  document.querySelectorAll('.tab-pane').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  event.target.classList.add('active');
+}
+if (location.hostname.endsWith('github.io')) {
+  const owner = location.hostname.split('.')[0];
+  const repo = (location.pathname.split('/').filter(Boolean)[0]) || 'tensormmu';
+  const repoUrl = `https://github.com/${owner}/${repo}`;
+  document.querySelectorAll('.nav-links a[href="/"]').forEach(a => {
+    a.href = repoUrl;
+    a.textContent = 'GitHub Repo';
+  });
+  const cta = document.getElementById('footer-cta');
+  if (cta) {
+    cta.href = repoUrl;
+    cta.textContent = 'View Repository on GitHub →';
+  }
+}
+</script>
+</body>
+</html>

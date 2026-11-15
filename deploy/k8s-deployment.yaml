@@ -1,0 +1,98 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tensormmu
+  labels:
+    app: tensormmu
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: tensormmu
+  template:
+    metadata:
+      labels:
+        app: tensormmu
+    spec:
+      # Optional for AWS EKS GPU node groups (g5, g6e, p4d, p5):
+      # nodeSelector:
+      #   nvidia.com/gpu.present: "true"
+      containers:
+        - name: tensormmu
+          image: tensormmu:latest
+          args:
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8000"
+            - "--fail-livez-on-error"
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: TMMU_MODEL
+              value: "Qwen/Qwen3-Next-80B-A3B-Instruct"
+            - name: TMMU_DEFAULT_MAX_TOKENS
+              value: "32768"
+            - name: TMMU_THINKING_BUDGET
+              value: "6144"
+            # Optional HF token secret for gated models:
+            # - name: HF_TOKEN
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: hf-credentials
+            #       key: token
+          resources:
+            requests:
+              cpu: "4"
+              memory: "32Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "16"
+              memory: "64Gi"
+              nvidia.com/gpu: "1"
+          # Liveness succeeds immediately (200 OK) while background download/compile runs,
+          # and flips to 500 only if bootstrap hits an unrecoverable error (--fail-livez-on-error).
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            failureThreshold: 3
+          # Readiness stays 503 while downloading/compiling/loading so Kubernetes Service
+          # holds traffic until the cartridge is warm in GPU VRAM + L2 Zero-Copy RAM.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 360
+          volumeMounts:
+            - name: models-pvc
+              mountPath: /models
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: models-pvc
+          persistentVolumeClaim:
+            claimName: tensormmu-models-pvc
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tensormmu
+spec:
+  selector:
+    app: tensormmu
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

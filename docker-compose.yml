@@ -1,0 +1,36 @@
+services:
+  tensormmu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tensormmu:latest
+    container_name: tensormmu
+    ports:
+      - "8000:8000"
+    #Generous /dev/shm for pinned zero-copy host pages on Linux
+    shm_size: "4gb"
+    environment:
+      # Set TMMU_MODEL to a Hugging Face ID (auto-downloads & stream-compiles on first boot)
+      # OR an already-compiled cartridge name inside ./checkpoints:
+      - TMMU_MODEL=${TMMU_MODEL:-google/gemma-4-26B-A4B-it}
+      - HF_TOKEN=${HF_TOKEN:-}
+      - TMMU_API_KEY=${TMMU_API_KEY:-}
+      - TMMU_DEFAULT_MAX_TOKENS=${TMMU_DEFAULT_MAX_TOKENS:-32768}
+      - TMMU_THINKING_BUDGET=${TMMU_THINKING_BUDGET:-6144}
+    volumes:
+      - ./checkpoints:/models/cartridges
+      - ./hf_cache:/models/hf_cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/readyz"]
+      interval: 15s
+      timeout: 5s
+      retries: 120
+      start_period: 30s
+    restart: unless-stopped

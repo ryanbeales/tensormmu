@@ -1,0 +1,8 @@
+torch>=2.2.0
+transformers>=4.51.0
+safetensors>=0.4.3
+accelerate>=0.30.0
+huggingface_hub>=0.24.0
+aiohttp>=3.9.0
+datasets>=2.18.0
+numpy>=1.26.0

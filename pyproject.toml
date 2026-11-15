@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tensormmu"
+version = "0.1.0"
+description = "TensorMMU: Hardware-Inspired GPU Virtual Memory, TLB Paging & Zero-Copy Inference Server for Sparse-MoE LLMs and Coding Agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["llm", "moe", "inference", "cuda", "virtual-memory", "tlb", "agents", "openai", "anthropic"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.2.0",
+    "transformers>=4.51.0",
+    "safetensors>=0.4.3",
+    "accelerate>=0.30.0",
+    "huggingface_hub>=0.24.0",
+    "aiohttp>=3.9.0",
+    "datasets>=2.18.0",
+    "numpy>=1.26.0",
+]
+
+[project.scripts]
+tmmu = "tensormmu.cli:main"
+tensormmu = "tensormmu.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tensormmu*", "runtime*", "decompiler*", "data*", "eval*", "models*"]

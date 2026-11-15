@@ -1,0 +1,405 @@
+{
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "models": {
+    "gemma_4_26b_a4b": {
+      "label": "Gemma-4-26B-A4B-it",
+      "nvm_dir": "checkpoints\\gemma-4-26B-A4B-it-nvm-moe.nvm",
+      "tlb_slots_l1": 48,
+      "l2_zero_copy_slots": 80,
+      "l2_pinned_ram_gb": 7.48,
+      "all_experts_mapped": true,
+      "cuda_graph_mode": "full_graph",
+      "tlb_strategy": "overlap_shared_mlp",
+      "phase_g_reference": {
+        "core_only_m1_ms": 86.93,
+        "slots_48_m1_tok_s": 8.42,
+        "slots_48_spec_tok_s": 13.04,
+        "all_resident_gsm8k_5prob_tok_s": 16.66,
+        "slots_48_vram_mb": 7752.3,
+        "all_resident_vram_mb": 15396.3
+      },
+      "core_only_cuda_graph": {
+        "m1_ms_per_pass": 7.286884000059217,
+        "m1_equiv_tok_per_s": 137.23286935703567,
+        "m4_ms_per_pass": 10.370203999336809,
+        "m4_equiv_tok_per_s": 385.720473797411
+      },
+      "prefill_ttft_256": {
+        "prompt_tokens": 232,
+        "legacy_ttft_ms": 2824.52,
+        "phase_h3_ttft_ms": 523.42,
+        "speedup_x": 5.4,
+        "first_token_match": true
+      },
+      "greedy_parity_32": {
+        "exact_match": false,
+        "prefix_match_tokens": 23,
+        "sample_output": "It appears there may be a misunderstanding in the prompt, as the question asks for an explanation of a technical concept rather than a mathematical problem to solve. However"
+      },
+      "open_ended_m1_96": {
+        "tok_per_s": 33.88,
+        "ms_per_token": 29.51,
+        "tlb_hit_rate_pct": 100.0,
+        "pcie_mb_per_token": 0.0,
+        "cuda_allocated_mb": 8378.9
+      },
+      "gsm8k_5prob_m1": {
+        "solved": 5,
+        "total": 5,
+        "accuracy_pct": 100.0,
+        "tok_per_s": 46.26,
+        "ms_per_token": 21.62,
+        "tokens_per_step": 0.993,
+        "acceptance_rate_pct": 0.0,
+        "pcie_mb_per_token": 0.0,
+        "cuda_allocated_mb": 8338.8,
+        "os_working_set_mb": 22156.2,
+        "per_problem": [
+          {
+            "idx": 0,
+            "target": "18",
+            "pred": "18",
+            "correct": true,
+            "emitted_tokens": 97,
+            "forward_steps": 97,
+            "tokens_per_step": 1.0,
+            "tok_per_s": 46.22,
+            "ms_per_token": 21.64,
+            "tlb_hit_rate_pct": 100.0,
+            "pcie_mb_per_token": 0.0
+          },
+          {
+            "idx": 1,
+            "target": "3",
+            "pred": "3",
+            "correct": true,
+            "emitted_tokens": 80,
+            "forward_steps": 80,
+            "tokens_per_step": 1.0,
+            "tok_per_s": 48.85,
+            "ms_per_token": 20.47,
+            "tlb_hit_rate_pct": 100.0,
+            "pcie_mb_per_token": 0.0
+          },
+          {
+            "idx": 2,
+            "target": "70000",
+            "pred": "70000",
+            "correct": true,
+            "emitted_tokens": 212,
+            "forward_steps": 212,
+            "tokens_per_step": 1.0,
+            "tok_per_s": 47.75,
+            "ms_per_token": 20.94,
+            "tlb_hit_rate_pct": 100.0,
+            "pcie_mb_per_token": 0.0
+          },
+          {
+            "idx": 3,
+            "target": "540",
+            "pred": "540",
+            "correct": true,
+            "emitted_tokens": 141,
+            "forward_steps": 141,
+            "tokens_per_step": 1.0,
+            "tok_per_s": 46.0,
+            "ms_per_token": 21.74,
+            "tlb_hit_rate_pct": 100.0,
+            "pcie_mb_per_token": 0.0
+          },
+          {
+            "idx": 4,
+            "target": "20",
+            "pred": "20",
+            "correct": true,
+            "emitted_tokens": 176,
+            "forward_steps": 176,
+            "tokens_per_step": 1.0,
+            "tok_per_s": 44.99,
+            "ms_per_token": 22.23,
+            "tlb_hit_rate_pct": 100.0,
+            "pcie_mb_per_token": 0.0
+          }
+        ]
+      },
+      "gsm8k_5prob_two_tier": {
+        "solved": 5,
+        "total": 5,
+        "accuracy_pct": 100.0,
+        "tok_per_s": 45.18,
+        "ms_per_token": 22.13,
+        "tokens_per_step": 1.075,
+        "acceptance_rate_pct": 31.76,
+        "pcie_mb_per_token": 0.0,
+        "cuda_allocated_mb": 8367.8,
+        "os_working_set_mb": 22182.9,
+        "per_problem": [
+          {
+            "idx": 0,
+            "target": "18",
+            "pred": "18",
+            "correct": true,
+            "emitted_tokens": 97,
+            "forward_steps": 97,
+            "tokens_per_step": 1.0,
+            "tok_per_s": 46.32,
+            "ms_per_token": 21.59,
+            "tlb_hit_rate_pct": 100.0,
+            "pcie_mb_per_token": 0.0
+          },
+          {
+            "idx": 1,
+            "target": "3",
+            "pred": "3",
+            "correct": true,
+            "emitted_tokens": 80,
+            "forward_steps": 79,
+            "tokens_per_step": 1.013,
+            "tok_per_s": 48.5,
+            "ms_per_token": 20.62,
+            "tlb_hit_rate_pct": 100.0,
+            "pcie_mb_per_token": 0.0
+          },
+          {
+            "idx": 2,
+            "target": "70000",
+            "pred": "70000",
+            "correct": true,
+            "emitted_tokens": 212,
+            "forward_steps": 176,
+            "tokens_per_step": 1.205,
+            "tok_per_s": 47.22,
+            "ms_per_token": 21.18,
+            "tlb_hit_rate_pct": 100.0,
+            "pcie_mb_per_token": 0.0
+          },
+          {
+            "idx": 3,
+            "target": "540",
+            "pred": "540",
+            "correct": true,
+            "emitted_tokens": 141,
+            "forward_steps": 132,
+            "tokens_per_step": 1.068,
+            "tok_per_s": 44.42,
+            "ms_per_token": 22.51,
+            "tlb_hit_rate_pct": 100.0,
+            "pcie_mb_per_token": 0.0
+          },
+          {
+            "idx": 4,
+            "target": "20",
+            "pred": "20",
+            "correct": true,
+            "emitted_tokens": 176,
+            "forward_steps": 168,
+            "tokens_per_step": 1.048,
+            "tok_per_s": 42.86,
+            "ms_per_token": 23.33,
+            "tlb_hit_rate_pct": 100.0,
+            "pcie_mb_per_token": 0.0
+          }
+        ]
+      }
+    },
+    "qwen3_next_80b_a3b": {
+      "label": "Qwen3-Next-80B-A3B-Instruct",
+      "nvm_dir": "checkpoints\\Qwen3-Next-80B-A3B-Instruct-nvm-moe.nvm",
+      "tlb_slots_l1": 192,
+      "l2_zero_copy_slots": 0,
+      "l2_pinned_ram_gb": 0.0,
+      "all_experts_mapped": false,
+      "cuda_graph_mode": "piecewise_graph",
+      "tlb_strategy": "overlap_shared_mlp",
+      "phase_g_reference": {
+        "core_only_m1_ms": 77.82,
+        "slots_192_m1_tok_s": 5.44,
+        "slots_192_gsm8k_5prob_tok_s": 7.96,
+        "slots_192_vram_mb": 18282.7
+      },
+      "core_only_cuda_graph": {
+        "m1_ms_per_pass": 7.108043999178335,
+        "m1_equiv_tok_per_s": 140.68567950839872,
+        "m4_ms_per_pass": 10.741335999919102,
+        "m4_equiv_tok_per_s": 372.3931548207901
+      },
+      "prefill_ttft_256": {
+        "prompt_tokens": 222,
+        "legacy_ttft_ms": 11485.1,
+        "phase_h3_ttft_ms": 4543.99,
+        "speedup_x": 2.53,
+        "first_token_match": true
+      },
+      "greedy_parity_32": {
+        "exact_match": true,
+        "prefix_match_tokens": 32,
+        "sample_output": "Virtual memory paging is primarily an OS concept; GPUs typically use system memory managed by the OS, not independent paging. Here\u2019s how it works in OSes:\n\n"
+      },
+      "open_ended_m1_96": {
+        "tok_per_s": 12.18,
+        "ms_per_token": 82.07,
+        "tlb_hit_rate_pct": 95.09,
+        "pcie_mb_per_token": 39.81,
+        "cuda_allocated_mb": 19233.4
+      },
+      "gsm8k_5prob_m1": {
+        "solved": 5,
+        "total": 5,
+        "accuracy_pct": 100.0,
+        "tok_per_s": 26.15,
+        "ms_per_token": 38.24,
+        "tokens_per_step": 0.994,
+        "acceptance_rate_pct": 0.0,
+        "pcie_mb_per_token": 69.61,
+        "cuda_allocated_mb": 19193.1,
+        "os_working_set_mb": 24938.7,
+        "per_problem": [
+          {
+            "idx": 0,
+            "target": "18",
+            "pred": "18",
+            "correct": true,
+            "emitted_tokens": 180,
+            "forward_steps": 180,
+            "tokens_per_step": 1.0,
+            "tok_per_s": 20.12,
+            "ms_per_token": 49.7,
+            "tlb_hit_rate_pct": 91.11,
+            "pcie_mb_per_token": 72.01
+          },
+          {
+            "idx": 1,
+            "target": "3",
+            "pred": "3",
+            "correct": true,
+            "emitted_tokens": 93,
+            "forward_steps": 93,
+            "tokens_per_step": 1.0,
+            "tok_per_s": 24.49,
+            "ms_per_token": 40.84,
+            "tlb_hit_rate_pct": 90.52,
+            "pcie_mb_per_token": 76.83
+          },
+          {
+            "idx": 2,
+            "target": "70000",
+            "pred": "70000",
+            "correct": true,
+            "emitted_tokens": 319,
+            "forward_steps": 319,
+            "tokens_per_step": 1.0,
+            "tok_per_s": 28.48,
+            "ms_per_token": 35.11,
+            "tlb_hit_rate_pct": 91.77,
+            "pcie_mb_per_token": 66.69
+          },
+          {
+            "idx": 3,
+            "target": "540",
+            "pred": "540",
+            "correct": true,
+            "emitted_tokens": 86,
+            "forward_steps": 86,
+            "tokens_per_step": 1.0,
+            "tok_per_s": 32.55,
+            "ms_per_token": 30.73,
+            "tlb_hit_rate_pct": 91.45,
+            "pcie_mb_per_token": 69.29
+          },
+          {
+            "idx": 4,
+            "target": "20",
+            "pred": "20",
+            "correct": true,
+            "emitted_tokens": 119,
+            "forward_steps": 119,
+            "tokens_per_step": 1.0,
+            "tok_per_s": 32.16,
+            "ms_per_token": 31.1,
+            "tlb_hit_rate_pct": 91.92,
+            "pcie_mb_per_token": 65.49
+          }
+        ]
+      },
+      "gsm8k_5prob_two_tier": {
+        "solved": 5,
+        "total": 5,
+        "accuracy_pct": 100.0,
+        "tok_per_s": 28.44,
+        "ms_per_token": 35.16,
+        "tokens_per_step": 1.073,
+        "acceptance_rate_pct": 37.74,
+        "pcie_mb_per_token": 73.12,
+        "cuda_allocated_mb": 19220.2,
+        "os_working_set_mb": 24998.7,
+        "per_problem": [
+          {
+            "idx": 0,
+            "target": "18",
+            "pred": "18",
+            "correct": true,
+            "emitted_tokens": 182,
+            "forward_steps": 177,
+            "tokens_per_step": 1.028,
+            "tok_per_s": 34.52,
+            "ms_per_token": 28.97,
+            "tlb_hit_rate_pct": 93.02,
+            "pcie_mb_per_token": 60.29
+          },
+          {
+            "idx": 1,
+            "target": "3",
+            "pred": "3",
+            "correct": true,
+            "emitted_tokens": 93,
+            "forward_steps": 92,
+            "tokens_per_step": 1.011,
+            "tok_per_s": 32.12,
+            "ms_per_token": 31.13,
+            "tlb_hit_rate_pct": 90.3,
+            "pcie_mb_per_token": 80.76
+          },
+          {
+            "idx": 2,
+            "target": "70000",
+            "pred": "70000",
+            "correct": true,
+            "emitted_tokens": 333,
+            "forward_steps": 282,
+            "tokens_per_step": 1.181,
+            "tok_per_s": 23.94,
+            "ms_per_token": 41.77,
+            "tlb_hit_rate_pct": 90.64,
+            "pcie_mb_per_token": 77.0
+          },
+          {
+            "idx": 3,
+            "target": "540",
+            "pred": "540",
+            "correct": true,
+            "emitted_tokens": 84,
+            "forward_steps": 81,
+            "tokens_per_step": 1.037,
+            "tok_per_s": 30.64,
+            "ms_per_token": 32.64,
+            "tlb_hit_rate_pct": 91.11,
+            "pcie_mb_per_token": 78.81
+          },
+          {
+            "idx": 4,
+            "target": "20",
+            "pred": "20",
+            "correct": true,
+            "emitted_tokens": 119,
+            "forward_steps": 119,
+            "tokens_per_step": 1.0,
+            "tok_per_s": 33.82,
+            "ms_per_token": 29.57,
+            "tlb_hit_rate_pct": 91.85,
+            "pcie_mb_per_token": 68.86
+          }
+        ]
+      }
+    }
+  }
+}

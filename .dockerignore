@@ -1,0 +1,11 @@
+.git
+.venv
+venv
+__pycache__
+*.pyc
+checkpoints
+hf_cache
+tmp
+*.log
+.vscode
+.idea
