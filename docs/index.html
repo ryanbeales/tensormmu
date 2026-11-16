@@ -308,11 +308,25 @@
     </p>
     <ul>
       <li>
+        <strong><a href="https://github.com/Niko1221/Strata" target="_blank" rel="noopener">Strata (<code>Niko1221/Strata</code>)</a>,
+        <a href="https://github.com/simplexai-labs/PolyStrata" target="_blank" rel="noopener">PolyStrata</a> &amp;
+        <a href="https://github.com/aflin/momoe" target="_blank" rel="noopener">MoMoE</a>:</strong>
+        C++/<code>llama.cpp</code> forks that hit higher peak <code>tok/s</code> (<code>~95–120+</code> on <code>64 GB+</code> RAM rigs) by combining
+        aggressive <code>2–3 bit</code> (<code>IQ2/IQ3</code>) GGUF quants, native <code>MTP</code> multi-token drafting, and <strong>CPU <code>AVX-512</code> compute</strong>
+        for cold experts. TensorMMU instead runs <strong>100% on the GPU</strong> at lossless <code>4-bit</code> directly from Hugging Face <code>.safetensors</code> —
+        paging across VRAM, zero-copy DDR5, and NVMe inside CUDA Graphs (even on <code>32 GB</code> RAM PCs or CPU-constrained K8s pods) and scaling straight onto AWS H100s.
+      </li>
+      <li>
         <strong><a href="https://github.com/JustVugg/colibri" target="_blank" rel="noopener">Colibrì (<code>JustVugg/colibri</code>)</a>:</strong>
         Pure-C hierarchical <code>NVMe → RAM → GPU</code> MoE engine using raw async C file I/O and <code>.coli_usage</code> hot-store pinning.
         Colibrì is purpose-built for streaming ultra-giant <code>400B–744B</code> MoEs (<code>GLM-5</code>, <code>DeepSeek-V3</code>) from NVMe on modest rigs,
         whereas TensorMMU targets higher single-GPU decode throughput (<code>28–55 tok/s</code>) and full OpenAI/Anthropic tool-calling in the
         <code>26B–120B+</code> regime via L2 Zero-Copy mapped PCIe reads and Full/Piecewise CUDA Graphs.
+      </li>
+      <li>
+        <strong><a href="https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming" target="_blank" rel="noopener">Adaptive KV Streaming (<code>RaymondHuang210129</code>)</a>:</strong>
+        Orthogonal and complementary — streams long-context <em>KV cache blocks</em> (<code>128K–256K</code>) from System RAM through a shared GPU ring buffer when weights already fit in VRAM,
+        whereas TensorMMU pages <em>MoE model weights</em> while growing a GPU-resident KV cache on demand (<code>4K → 32K</code>).
       </li>
       <li>
         <strong><code>llama.cpp</code> &amp; <code>KTransformers</code>:</strong> Execute offloaded MoE experts on <em>host CPU cores</em>
