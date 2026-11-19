@@ -11,6 +11,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from tensormmu import ensure_torch_cuda_nvrtc_utils
+
+ensure_torch_cuda_nvrtc_utils()
+
 MAX_FUSED_DECODE_TOKENS = 8
 
 PHASE_C_CUDA_SOURCE = r"""
