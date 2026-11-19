@@ -159,7 +159,7 @@ def ensure_torch_cuda_nvrtc_utils() -> None:
             ptx = ptx.encode("utf-8")
         module = ctypes.c_void_p()
         stream = torch.cuda.current_stream()
-        with stream:
+        with torch.cuda.stream(stream):
             _check_cuda(libcuda.cuModuleLoadData(ctypes.byref(module), ptx))
         if not kernel_names:
             return _CudaModule(module)
