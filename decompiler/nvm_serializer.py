@@ -843,7 +843,7 @@ def compile_streaming_to_nvm(
 
         for i in range(num_total_layers):
             decoder_layers[i] = orig_meta_layers[i]
-        del spy_layers
+        del spy_layers, orig_meta_layers
 
     peak_preamble_vram_mb = (
         torch.cuda.max_memory_allocated(dev) / (1024 ** 2)
@@ -1146,9 +1146,20 @@ def compile_streaming_to_nvm(
             peak_layer_vram_mb = max(peak_layer_vram_mb, cur_peak)
 
         # Evict finished layer `idx` back to 0-byte `meta` immediately!
+        for env in envelopes:
+            env.layer_args_cpu.pop(idx, None)
+            env.layer_kwargs_cpu.pop(idx, None)
         _evict_module_to_meta(layer_mod)
-        decoder_layers[idx] = None  # type: ignore[assignment]
+        decoder_layers[idx] = nn.Identity()  # type: ignore[assignment]
+        del layer_mod
         gc.collect()
+        if os.name != "nt":
+            try:
+                import ctypes
+
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
         if torch.cuda.is_available() and dev.type == "cuda":
             torch.cuda.empty_cache()
 
@@ -1567,7 +1578,7 @@ def compile_streaming_moe_to_nvm(
 
     for i in range(num_total_layers):
         decoder_layers[i] = orig_meta_layers[i]
-    del spy_layers
+    del spy_layers, orig_meta_layers
 
     peak_preamble_vram_mb = (
         torch.cuda.max_memory_allocated(dev) / (1024 ** 2)
@@ -1800,6 +1811,8 @@ def compile_streaming_moe_to_nvm(
             moe_core_tensors, moe_page_tensors, moe_meta = moe_vm.export_serialized_core_and_pages()
             moe_meta["tlb_slots"] = int(min(E, max(1, tlb_slots)))
             moe_vm.release_tlb()
+            moe_vm.tlb_cache.host_expert_pages = torch.empty((0, 0), dtype=torch.uint8, device="cpu")
+            setattr(exp_parent, exp_attr, nn.Identity())
 
             non_exp_tensors = _export_module_cpu_tensors(layer_mod, skip_submodules=(experts_rel,))
             combined_core: Dict[str, torch.Tensor] = {}
@@ -1842,9 +1855,20 @@ def compile_streaming_moe_to_nvm(
             cur_peak = torch.cuda.max_memory_allocated(dev) / (1024 ** 2)
             peak_layer_vram_mb = max(peak_layer_vram_mb, cur_peak)
 
+        for env in envelopes:
+            env.layer_args_cpu.pop(idx, None)
+            env.layer_kwargs_cpu.pop(idx, None)
         _evict_module_to_meta(layer_mod)
-        decoder_layers[idx] = None  # type: ignore[assignment]
+        decoder_layers[idx] = nn.Identity()  # type: ignore[assignment]
+        del layer_mod
         gc.collect()
+        if os.name != "nt":
+            try:
+                import ctypes
+
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
         if torch.cuda.is_available() and dev.type == "cuda":
             torch.cuda.empty_cache()
 
@@ -2486,7 +2510,7 @@ def evaluate_streaming_dense_bf16_ppl(
 
     for i in range(num_total_layers):
         decoder_layers[i] = orig_meta_layers[i]
-    del spy_layers
+    del spy_layers, orig_meta_layers
 
     # Evict Preamble while streaming 0 .. L-1
     if tie_word_embeddings and hasattr(model, "lm_head"):
