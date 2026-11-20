@@ -435,14 +435,14 @@ class TensorMMUEngine:
             self.page_storage = eff_storage
             self.draft_mode = eff_draft
 
-            self.set_bootstrap_state("loading", f"Capturing initial M=1 CUDA Graph for `{model_id}`...")
+            self.set_bootstrap_state("loading", f"Capturing initial M=1..4 CUDA Graphs for `{model_id}`...")
             with torch.no_grad():
                 w_ids = torch.tensor([[1, 2]], dtype=torch.long, device=self.device)
                 w_out = self.model(input_ids=w_ids, attention_mask=torch.ones_like(w_ids), use_cache=True)
                 runner_warm = getattr(self.model, "_nvm_graph_runner", None)
                 if runner_warm is not None and runner_warm.is_supported:
                     if runner_warm.bind_prefill_cache(w_out.past_key_values, seq_len=2, max_total_len=4096):
-                        runner_warm.ensure_captured([1])
+                        runner_warm.ensure_captured([1, 2, 3, 4] if self.draft_mode != "none" else [1])
                 del w_out
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()

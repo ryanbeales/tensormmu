@@ -763,18 +763,13 @@ class GPUExpertTLBCache(nn.Module):
                         self._step_spec_touched.append((slot, min_draft_tok[e], prev_p, prev_lu))
             elif has_l2 and l2_home[e] >= 0:
                 # Hit in L2 Zero-Copy Pinned DDR5!
-                # Serve transient / 1st hit directly over Zero-Copy PCIe (zero L1 eviction, zero DMA wait);
-                # promote hot repeated topic experts (`>= 2` verified hits) into 1 TB/s L1 VRAM!
+                # Serve directly over Zero-Copy PCIe (zero L1 eviction, zero DMA wait)
+                # so L1 and L2 stay strictly disjoint and never evict top-L1 experts to L3 disk.
                 if is_ver:
                     self._l2_hit_counts[e] += 1
-                if is_ver and self._l2_hit_counts[e] >= 2 and can_promote_l2:
-                    self._page_misses += 1
-                    self._demand_misses += 1
-                    misses.append(e)
-                else:
-                    self._l2_zero_copy_hits += 1
-                    self._pcie_bytes += self.bytes_per_page
-                    self._distinct_pages.add(e)
+                self._l2_zero_copy_hits += 1
+                self._pcie_bytes += self.bytes_per_page
+                self._distinct_pages.add(e)
             else:
                 self._page_misses += 1
                 self._demand_misses += 1
