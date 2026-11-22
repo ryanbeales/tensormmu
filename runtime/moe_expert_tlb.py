@@ -286,6 +286,7 @@ class GPUExpertTLBCache(nn.Module):
         self.l2_zero_copy_dev_ptr: int = 0
         self._l2_aliases_host_pages: bool = False
         self._expert_l2_home: List[int] = [-1] * self.num_experts
+        self._l2_slot_to_expert: List[int] = []
         self._l2_hit_counts: List[int] = [0] * self.num_experts
         self.all_experts_mapped: bool = False
         self.layout_version: int = 0
@@ -303,6 +304,7 @@ class GPUExpertTLBCache(nn.Module):
                 self.l2_zero_copy_dev_ptr = zc_ptr
                 self._l2_aliases_host_pages = True
                 self._expert_l2_home = list(range(self.num_experts))
+                self._l2_slot_to_expert = list(range(self.num_experts))
             except Exception:
                 pass
 
@@ -351,6 +353,7 @@ class GPUExpertTLBCache(nn.Module):
             self.l2_slots = 0
             self.l2_zero_copy_dev_ptr = 0
             self._expert_l2_home = [-1] * self.num_experts
+            self._l2_slot_to_expert = []
             self._l2_hit_counts = [0] * self.num_experts
             if self._is_allocated:
                 for e in range(self.num_experts):
@@ -359,6 +362,26 @@ class GPUExpertTLBCache(nn.Module):
                 self.gpu_expert_to_slot.copy_(self._cpu_slot_map, non_blocking=True)
             self._recompute_all_mapped_flag()
             self.layout_version += 1
+
+    def _reseed_l2_disjoint_from_l1(self) -> None:
+        """Restores disjoint L2 population (`freq_rank_list` not in L1) after a full L1 re-seed."""
+        if self._l2_aliases_host_pages or self.l2_pinned_pages is None or self.l2_slots <= 0:
+            return
+        in_l1 = {e for e in range(self.num_experts) if self._expert_to_slot[e] >= 0}
+        self._expert_l2_home = [-1] * self.num_experts
+        self._l2_hit_counts = [0] * self.num_experts
+        chosen: List[int] = []
+        for exp_id in self.freq_rank_list:
+            if exp_id not in in_l1:
+                chosen.append(int(exp_id))
+                if len(chosen) >= int(self.l2_pinned_pages.shape[0]):
+                    break
+        for idx_l2, exp_id in enumerate(chosen):
+            if idx_l2 >= len(self._l2_slot_to_expert) or self._l2_slot_to_expert[idx_l2] != exp_id:
+                self.l2_pinned_pages[idx_l2].copy_(self.host_expert_pages[exp_id])
+            self._expert_l2_home[exp_id] = idx_l2
+        self._l2_slot_to_expert = list(chosen)
+        self.l2_slots = len(chosen)
 
     def configure_l2_zero_copy(self, l2_slots: int) -> int:
         """Allocates `l2_slots` of device-mapped pinned host DDR5 seeded with calibration-ranked warm experts."""
@@ -373,6 +396,7 @@ class GPUExpertTLBCache(nn.Module):
         self.l2_slots = 0
         self.l2_zero_copy_dev_ptr = 0
         self._expert_l2_home = [-1] * self.num_experts
+        self._l2_slot_to_expert = []
         self._l2_hit_counts = [0] * self.num_experts
 
         if target > 0:
@@ -385,10 +409,7 @@ class GPUExpertTLBCache(nn.Module):
 
             if buf is not None and zc_ptr != 0:
                 # Seed L2 with next-hottest experts not initially in L1 (`freq_rank_list[tlb_slots : tlb_slots + target]`)
-                l1_set = {e for e in self._expert_to_slot if e >= 0}
-                # Wait: `_expert_to_slot[e]` maps `e -> l1_slot`; build set of experts currently in L1
                 in_l1 = {e for e in range(self.num_experts) if self._expert_to_slot[e] >= 0}
-                del l1_set
                 chosen: List[int] = []
                 for exp_id in self.freq_rank_list:
                     if exp_id not in in_l1:
@@ -399,6 +420,7 @@ class GPUExpertTLBCache(nn.Module):
                     buf[idx_l2].copy_(self.host_expert_pages[exp_id])
                     self._expert_l2_home[exp_id] = idx_l2
                 self.l2_pinned_pages = buf
+                self._l2_slot_to_expert = list(chosen)
                 self.l2_slots = len(chosen)
                 self.l2_zero_copy_dev_ptr = zc_ptr
 
@@ -527,6 +549,16 @@ class GPUExpertTLBCache(nn.Module):
             self._slot_last_used[slot] = n_seed - slot
         self._access_clock = n_seed + 1
         self._num_valid = n_seed
+        if (
+            not self._l2_aliases_host_pages
+            and self.l2_slots > 0
+            and self.l2_pinned_pages is not None
+            and any(self._expert_l2_home[self._slot_to_expert[s]] >= 0 for s in range(n_seed))
+        ):
+            self._reseed_l2_disjoint_from_l1()
+            for e in range(self.num_experts):
+                if self._expert_to_slot[e] < 0:
+                    self._cpu_slot_map[e] = self._fallback_encoded_slot(e)
         self.gpu_expert_to_slot.copy_(self._cpu_slot_map, non_blocking=True)
         self._recompute_all_mapped_flag()
         self.layout_version += 1
@@ -729,7 +761,13 @@ class GPUExpertTLBCache(nn.Module):
         if len(must_be_in_l1) > self.tlb_slots:
             return uniq
 
-        can_promote_l2 = len(uniq) <= self.tlb_slots
+        can_promote_l2 = (
+            len(uniq) <= self.tlb_slots
+            and self.tlb_slots > 0
+            and not self._l2_aliases_host_pages
+            and self.l2_pinned_pages is not None
+        )
+        l2_promotions_this_step = 0
         misses: List[int] = []
         had_prefetched_hit = False
 
@@ -763,13 +801,25 @@ class GPUExpertTLBCache(nn.Module):
                         self._step_spec_touched.append((slot, min_draft_tok[e], prev_p, prev_lu))
             elif has_l2 and l2_home[e] >= 0:
                 # Hit in L2 Zero-Copy Pinned DDR5!
-                # Serve directly over Zero-Copy PCIe (zero L1 eviction, zero DMA wait)
-                # so L1 and L2 stay strictly disjoint and never evict top-L1 experts to L3 disk.
+                # Serve transient hits (1..3) directly over Zero-Copy PCIe (zero L1 churn, zero DMA wait);
+                # on sustained usage (`>= 4` verified hits), perform an Exclusive L1 <-> L2 Swap so `e`
+                # promotes into 1 TB/s L1 VRAM while the evicted L1 expert demotes into `e`'s vacated L2 slot!
                 if is_ver:
                     self._l2_hit_counts[e] += 1
-                self._l2_zero_copy_hits += 1
-                self._pcie_bytes += self.bytes_per_page
-                self._distinct_pages.add(e)
+                if (
+                    is_ver
+                    and self._l2_hit_counts[e] >= 4
+                    and can_promote_l2
+                    and l2_promotions_this_step < 4
+                    and len(misses) < 20
+                ):
+                    l2_promotions_this_step += 1
+                    self._l2_zero_copy_hits += 1
+                    misses.append(e)
+                else:
+                    self._l2_zero_copy_hits += 1
+                    self._pcie_bytes += self.bytes_per_page
+                    self._distinct_pages.add(e)
             else:
                 self._page_misses += 1
                 self._demand_misses += 1
@@ -798,15 +848,62 @@ class GPUExpertTLBCache(nn.Module):
             else None
         )
         ws = get_shared_moe_workspace(self.device) if self.device.type == "cuda" else None
-        staged_pairs: List[Tuple[int, torch.Tensor]] = []
+        demote_d2h_pairs: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        staged_pairs: List[Tuple[int, torch.Tensor, int]] = []
 
         for e in misses:
             victim = self._choose_victim_slot(protected)
             protected.add(e)
             old_e = self._slot_to_expert[victim]
-            if old_e >= 0:
-                self._expert_to_slot[old_e] = -1
-                self._cpu_slot_map[old_e] = self._fallback_encoded_slot(old_e)
+            l2_idx = l2_home[e]
+            is_exclusive_l2_swap = (
+                l2_idx >= 0
+                and self.l2_pinned_pages is not None
+                and not self._l2_aliases_host_pages
+                and ws is not None
+            )
+
+            if is_exclusive_l2_swap:
+                assert self.l2_pinned_pages is not None and ws is not None
+                # 1. Stage `e` from pinned L2 into pinned DMA ring on CPU (`0` disk I/O)
+                r_slot, st_buf = ws.acquire_pinned_stage_slot(self.bytes_per_page)
+                st_buf.copy_(self.l2_pinned_pages[l2_idx])
+                l2_home[e] = -1
+                self._l2_hit_counts[e] = 0
+
+                # 2. Demote evicted L1 `old_e` (`tlb_pages[victim]`) into vacated `l2_pinned_pages[l2_idx]` via D2H DMA!
+                if old_e >= 0 and l2_home[old_e] < 0:
+                    self._expert_to_slot[old_e] = -1
+                    l2_home[old_e] = l2_idx
+                    if l2_idx < len(self._l2_slot_to_expert):
+                        self._l2_slot_to_expert[l2_idx] = old_e
+                    self._l2_hit_counts[old_e] = 0
+                    self._cpu_slot_map[old_e] = -2 - l2_idx
+                    demote_d2h_pairs.append((self.l2_pinned_pages[l2_idx], self.tlb_pages[victim]))
+                    self._pcie_bytes += self.bytes_per_page
+                else:
+                    if old_e >= 0:
+                        self._expert_to_slot[old_e] = -1
+                        self._cpu_slot_map[old_e] = self._fallback_encoded_slot(old_e)
+                    if l2_idx < len(self._l2_slot_to_expert):
+                        self._l2_slot_to_expert[l2_idx] = -1
+
+                staged_pairs.append((victim, st_buf, r_slot))
+            else:
+                if old_e >= 0:
+                    self._expert_to_slot[old_e] = -1
+                    self._cpu_slot_map[old_e] = self._fallback_encoded_slot(old_e)
+                if l2_idx >= 0 and self.l2_pinned_pages is not None:
+                    staged_pairs.append((victim, self.l2_pinned_pages[l2_idx], -1))
+                else:
+                    src = self.host_expert_pages[e]
+                    if src.is_pinned() or ws is None:
+                        staged_pairs.append((victim, src, -1))
+                    else:
+                        r_slot, st_buf = ws.acquire_pinned_stage_slot(self.bytes_per_page)
+                        st_buf.copy_(src)
+                        staged_pairs.append((victim, st_buf, r_slot))
+
             self._slot_to_expert[victim] = e
             self._expert_to_slot[e] = victim
             self._cpu_slot_map[e] = victim
@@ -822,23 +919,13 @@ class GPUExpertTLBCache(nn.Module):
             self._pcie_bytes += self.bytes_per_page
             self._distinct_pages.add(e)
 
-            l2_idx = l2_home[e]
-            if l2_idx >= 0 and self.l2_pinned_pages is not None:
-                staged_pairs.append((victim, self.l2_pinned_pages[l2_idx], -1))
-            else:
-                src = self.host_expert_pages[e]
-                if src.is_pinned() or ws is None:
-                    staged_pairs.append((victim, src, -1))
-                else:
-                    r_slot, st_buf = ws.acquire_pinned_stage_slot(self.bytes_per_page)
-                    st_buf.copy_(src)
-                    staged_pairs.append((victim, st_buf, r_slot))
-
         slot_snap = self._snapshot_slot_map()
         if stream is not None:
             with torch.cuda.stream(stream):
                 if self._has_compute_read_event and self._compute_read_event is not None:
                     stream.wait_event(self._compute_read_event)
+                for dst_l2_pinned, src_l1_vram in demote_d2h_pairs:
+                    dst_l2_pinned.copy_(src_l1_vram, non_blocking=True)
                 for vic, pinned_src, r_slot in staged_pairs:
                     self.tlb_pages[vic].copy_(pinned_src, non_blocking=True)
                     if r_slot >= 0 and ws is not None:
@@ -849,6 +936,8 @@ class GPUExpertTLBCache(nn.Module):
             self._dma_in_flight = True
         else:
             cur_s = torch.cuda.current_stream(self.device) if self.device.type == "cuda" else None
+            for dst_l2_pinned, src_l1_vram in demote_d2h_pairs:
+                dst_l2_pinned.copy_(src_l1_vram, non_blocking=True)
             for vic, pinned_src, r_slot in staged_pairs:
                 self.tlb_pages[vic].copy_(pinned_src, non_blocking=True)
                 if r_slot >= 0 and ws is not None:
