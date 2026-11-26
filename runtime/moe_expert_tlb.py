@@ -34,7 +34,9 @@ from runtime.moe_tlb_kernels import (
     MoETLBLayerLauncher,
     PREFILL_MAX_CHUNK_TOKENS,
     PREFILL_STAGE_SLOTS,
+    PinnedZeroCopyBuffer,
     WINAExpertPageLayout,
+    alloc_zero_copy_host_buffer,
     get_shared_moe_workspace,
     get_zero_copy_device_ptr,
     query_available_system_ram_bytes,
@@ -381,6 +383,7 @@ class GPUExpertTLBCache(nn.Module):
         self.l2_zero_copy_dev_ptr: int = 0
         self.l2_wina_pinned_pages: Optional[torch.Tensor] = None
         self.l2_wina_dev_ptr: int = 0
+        self._l2_zc_handle: Optional[PinnedZeroCopyBuffer] = None
         self.wina_layout: Optional[WINAExpertPageLayout] = (
             WINAExpertPageLayout.compute(layout.d_model, layout.d_ffn) if (layout.d_model % 64 == 0) else None
         )
@@ -462,6 +465,11 @@ class GPUExpertTLBCache(nn.Module):
         if not self._l2_aliases_host_pages:
             self.l2_pinned_pages = None
             self.l2_wina_pinned_pages = None
+            if self._l2_zc_handle is not None:
+                if torch.cuda.is_available() and self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+                self._l2_zc_handle.release()
+                self._l2_zc_handle = None
             self.l2_slots = 0
             self.l2_zero_copy_dev_ptr = 0
             self.l2_wina_dev_ptr = 0
@@ -536,6 +544,11 @@ class GPUExpertTLBCache(nn.Module):
         self.wina_keep_ratio = eff_ratio
         self.l2_pinned_pages = None
         self.l2_wina_pinned_pages = None
+        if self._l2_zc_handle is not None:
+            if torch.cuda.is_available() and self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            self._l2_zc_handle.release()
+            self._l2_zc_handle = None
         self.l2_slots = 0
         self.l2_zero_copy_dev_ptr = 0
         self.l2_wina_dev_ptr = 0
@@ -545,14 +558,20 @@ class GPUExpertTLBCache(nn.Module):
 
         if target > 0:
             pg_bytes = self.wina_layout.page_bytes if (use_wina and self.wina_layout is not None) else self.bytes_per_page
+            zc_handle: Optional[PinnedZeroCopyBuffer] = None
             try:
-                buf = torch.empty((target, pg_bytes), dtype=torch.uint8, device="cpu").pin_memory()
-                zc_ptr = get_zero_copy_device_ptr(buf, self.device)
+                zc_handle = alloc_zero_copy_host_buffer(target, pg_bytes, self.device)
+                buf = zc_handle.tensor
+                zc_ptr = zc_handle.dev_ptr
             except Exception:
+                if zc_handle is not None:
+                    zc_handle.release()
+                zc_handle = None
                 buf = None
                 zc_ptr = 0
 
             if buf is not None and zc_ptr != 0:
+                self._l2_zc_handle = zc_handle
                 # Seed L2 with next-hottest experts not initially in L1 (`freq_rank_list[tlb_slots : tlb_slots + target]`)
                 in_l1 = {e for e in range(self.num_experts) if self._expert_to_slot[e] >= 0}
                 chosen: List[int] = []
@@ -1903,34 +1922,51 @@ def auto_configure_moe_l2_zero_copy(
         except Exception:
             pass
 
-    avail_bytes, _ = query_available_system_ram_bytes()
+    avail_bytes, total_bytes = query_available_system_ram_bytes()
+    eff_wina = get_default_l2_wina_ratio() if wina_keep_ratio is None else max(0.20, min(1.0, float(wina_keep_ratio)))
+    use_wina = 0.0 < eff_wina < 1.0
+
+    def _eff_page_bytes(m: SparseMoETLBExperts) -> int:
+        if use_wina and m.tlb_cache.wina_layout is not None:
+            return int(m.tlb_cache.wina_layout.page_bytes)
+        return int(m.layout.page_bytes)
+
+    bytes_per_slot_across_model = sum(_eff_page_bytes(m) for m in layers)
     total_unmapped_bytes = sum(
-        max(0, m.num_experts - m.tlb_cache.tlb_slots) * m.layout.page_bytes for m in layers
+        max(0, m.num_experts - m.tlb_cache.tlb_slots) * _eff_page_bytes(m) for m in layers
     )
-    # When 100% of remaining experts fit in pinned DDR5 (`all_mapped == True`, e.g. Gemma-4-26B ~7.5 GB),
-    # `nvme_mmap` is never touched during decode so 4.0 GiB OS reserve suffices; when L3 `nvme_mmap` paging
-    # remains active (e.g. Qwen3-Next-80B 41.5 GB pages), keep `reserve_free_ram_gb` for OS Standby cache!
+    # When 100% of remaining experts fit in pinned DDR5 (`all_mapped == True`, e.g. Gemma-4-26B ~7.5 GB,
+    # or Qwen3-Next-80B on 64 GB+ RAM), `nvme_mmap` is never touched during decode so 4.0 GiB OS reserve suffices.
+    # When L3 `nvme_mmap` paging remains active, dynamically scale L2 to available free RAM while keeping
+    # `min(reserve_free_ram_gb, 30% of free RAM, >=6 GiB)` for OS + Standby file cache (no hardcoded 7.5 GiB cap!).
     full_map_reserve = int(min(float(reserve_free_ram_gb), 4.0) * (1024 ** 3))
     if total_unmapped_bytes + 128 * (1024 ** 2) <= max(0, avail_bytes - full_map_reserve):
         budget_bytes = max(0, avail_bytes - full_map_reserve - 128 * (1024 ** 2))
     else:
-        reserve_bytes = int(float(reserve_free_ram_gb) * (1024 ** 3))
-        budget_bytes = max(0, avail_bytes - reserve_bytes - 128 * (1024 ** 2))
+        dyn_reserve = max(6.0 * (1024 ** 3), min(float(reserve_free_ram_gb) * (1024 ** 3), 0.30 * float(avail_bytes)))
+        budget_bytes = max(0, avail_bytes - int(dyn_reserve) - 128 * (1024 ** 2))
 
+    env_cap = os.environ.get("TMMU_MAX_L2_RAM_GB", "").strip()
     if max_l2_ram_gb is not None:
         cap_bytes = int(float(max_l2_ram_gb) * (1024 ** 3))
+    elif env_cap:
+        try:
+            cap_bytes = int(float(env_cap) * (1024 ** 3))
+        except ValueError:
+            cap_bytes = budget_bytes
     else:
         if total_unmapped_bytes <= budget_bytes:
             cap_bytes = total_unmapped_bytes
+        elif os.name == "nt" and total_bytes > 0:
+            # Windows WDDM pinned-memory commit ceiling (~38% of physical RAM) so `cudaMalloc` never OOMs after L2 pin
+            cap_bytes = int(0.38 * float(total_bytes))
         else:
-            cap_bytes = int(7.5 * (1024 ** 3))
+            cap_bytes = budget_bytes
 
     eff_budget = min(budget_bytes, cap_bytes)
-    bytes_per_slot_across_model = sum(m.layout.page_bytes for m in layers)
     if bytes_per_slot_across_model <= 0 or eff_budget < bytes_per_slot_across_model:
         return {"l2_slots_per_layer": 0, "total_l2_gb": 0.0, "all_mapped": False}
 
-    eff_wina = get_default_l2_wina_ratio() if wina_keep_ratio is None else max(0.20, min(1.0, float(wina_keep_ratio)))
     l2_slots = eff_budget // bytes_per_slot_across_model
     for m in layers:
         m.tlb_cache.configure_l2_zero_copy(

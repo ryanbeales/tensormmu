@@ -1018,6 +1018,72 @@ def get_or_compile_moe_tlb_kernels(device: torch.device) -> Dict[str, Any]:
     return kd
 
 
+class PinnedZeroCopyBuffer:
+    """Exact-byte `cuMemHostAlloc(..., CU_MEMHOSTALLOC_DEVICEMAP)` host buffer without PyTorch power-of-2 slab waste."""
+
+    def __init__(self, rows: int, cols: int, device: torch.device) -> None:
+        import numpy as np
+
+        self._libcuda = None
+        self._host_ptr: int = 0
+        self.dev_ptr: int = 0
+        self.tensor: Optional[torch.Tensor] = None
+        self.nbytes: int = int(rows) * int(cols)
+        if self.nbytes <= 0:
+            self.tensor = torch.empty((int(rows), int(cols)), dtype=torch.uint8, device="cpu")
+            return
+
+        dev_idx = 0 if device.index is None else int(device.index)
+        kd = get_or_compile_moe_tlb_kernels(device)
+        libcuda = kd["libcuda"]
+        fn_alloc = getattr(libcuda, "cuMemHostAlloc")
+        fn_alloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_uint]
+        fn_alloc.restype = ctypes.c_int
+        fn_free = getattr(libcuda, "cuMemFreeHost")
+        fn_free.argtypes = [ctypes.c_void_p]
+        fn_free.restype = ctypes.c_int
+        fn_dptr = getattr(libcuda, "cuMemHostGetDevicePointer_v2", None) or getattr(libcuda, "cuMemHostGetDevicePointer")
+        fn_dptr.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_void_p, ctypes.c_uint]
+        fn_dptr.restype = ctypes.c_int
+
+        with torch.cuda.device(dev_idx):
+            hptr = ctypes.c_void_p(0)
+            res = fn_alloc(ctypes.byref(hptr), ctypes.c_size_t(self.nbytes), ctypes.c_uint(0x02))
+            if res != 0 or not hptr.value:
+                raise RuntimeError(f"cuMemHostAlloc({self.nbytes}) failed with CUDA driver error {res}")
+            dptr = ctypes.c_uint64(0)
+            res2 = fn_dptr(ctypes.byref(dptr), hptr, ctypes.c_uint(0))
+            if res2 != 0 or not dptr.value:
+                fn_free(hptr)
+                raise RuntimeError(f"cuMemHostGetDevicePointer_v2 failed with CUDA driver error {res2}")
+
+        self._libcuda = libcuda
+        self._fn_free = fn_free
+        self._host_ptr = int(hptr.value)
+        self.dev_ptr = int(dptr.value)
+        arr = np.ctypeslib.as_array((ctypes.c_uint8 * self.nbytes).from_address(self._host_ptr))
+        self.tensor = torch.from_numpy(arr).view(int(rows), int(cols))
+
+    def release(self) -> None:
+        self.tensor = None
+        self.dev_ptr = 0
+        if self._host_ptr and self._libcuda is not None:
+            ptr = self._host_ptr
+            self._host_ptr = 0
+            try:
+                self._fn_free(ctypes.c_void_p(ptr))
+            except Exception:
+                pass
+
+    def __del__(self) -> None:
+        self.release()
+
+
+def alloc_zero_copy_host_buffer(rows: int, cols: int, device: torch.device) -> PinnedZeroCopyBuffer:
+    """Allocates an exact-byte device-mapped pinned host buffer (`0%` CachingHostAllocator slab waste)."""
+    return PinnedZeroCopyBuffer(rows=rows, cols=cols, device=device)
+
+
 def get_zero_copy_device_ptr(pinned_host_tensor: torch.Tensor, device: torch.device) -> int:
     """Maps a `pin_memory=True` host tensor into the GPU's 64-bit UVA address space (`cuMemHostGetDevicePointer_v2`)."""
     if pinned_host_tensor.numel() == 0:
