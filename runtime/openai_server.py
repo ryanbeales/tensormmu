@@ -759,6 +759,13 @@ class TensorMMUEngine:
             pld_accepted = 0
             eagle_proposed = 0
             eagle_accepted = 0
+            prev_demand_misses = 0
+            l3_misses_per_tok_ema = 32.0
+            try:
+                mtp_warm_k = max(1, min(3, int(os.environ.get("TMMU_MTP_WARM_K", "2").strip() or "2")))
+            except ValueError:
+                mtp_warm_k = 2
+            mtp_warm_miss_thresh = max(8.0, 0.28 * float(len(self.paged_layers)))
 
             if first_tok in eos_ids:
                 finish_reason = "stop"
@@ -870,8 +877,15 @@ class TensorMMUEngine:
                                 self.paged_layers
                                 and all(getattr(m.tlb_cache, "all_experts_mapped", False) for m in self.paged_layers.values())
                             )
-                            k_mtp = min(3 if all_mapped_now else 1, k_budget)
-                            min_c = 0.25 if all_mapped_now else 0.55
+                            if all_mapped_now:
+                                k_mtp = min(3, k_budget)
+                                min_c = 0.25
+                            elif mtp_warm_k > 1 and forward_steps >= 4 and l3_misses_per_tok_ema <= mtp_warm_miss_thresh:
+                                k_mtp = min(mtp_warm_k, k_budget)
+                                min_c = 0.45
+                            else:
+                                k_mtp = min(1, k_budget)
+                                min_c = 0.55
                             draft_toks, _ = self.native_mtp.draft_k_tokens(
                                 last_tok_id=last_tok,
                                 last_hidden=h_verified,
@@ -896,8 +910,15 @@ class TensorMMUEngine:
                                 self.paged_layers
                                 and all(getattr(m.tlb_cache, "all_experts_mapped", False) for m in self.paged_layers.values())
                             )
-                            k_mtp = min(3 if all_mapped_now else 1, k_budget)
-                            min_c = 0.25 if all_mapped_now else 0.55
+                            if all_mapped_now:
+                                k_mtp = min(3, k_budget)
+                                min_c = 0.25
+                            elif mtp_warm_k > 1 and forward_steps >= 4 and l3_misses_per_tok_ema <= mtp_warm_miss_thresh:
+                                k_mtp = min(mtp_warm_k, k_budget)
+                                min_c = 0.45
+                            else:
+                                k_mtp = min(1, k_budget)
+                                min_c = 0.55
                             cand_mtp, _ = self.native_mtp.draft_k_tokens(
                                 last_tok_id=last_tok,
                                 last_hidden=h_verified,
@@ -1044,6 +1065,10 @@ class TensorMMUEngine:
                     h_verified = h_step_all[:, last_valid_pos : last_valid_pos + 1, :].clone()
                     for pos_i in range(max(1, valid_kv_added)):
                         c_ema.mul_(0.75).add_(h_step_all[:, pos_i : pos_i + 1, :], alpha=0.25)
+                    cur_demand_misses = sum(int(getattr(m.tlb_cache, "_demand_misses", 0)) for m in self.paged_layers.values())
+                    step_l3_misses = max(0, cur_demand_misses - prev_demand_misses)
+                    prev_demand_misses = cur_demand_misses
+                    l3_misses_per_tok_ema = 0.70 * l3_misses_per_tok_ema + 0.30 * (float(step_l3_misses) / float(max(1, M)))
                 else:
                     assert step_logits_gpu is not None
                     sampled_tok = _sample_next_token(

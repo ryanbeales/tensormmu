@@ -1180,6 +1180,9 @@ class CUDAGraphDecodeRunner:
                     _, rw, sel_idx = lyr.router(h_flat)
                     router_in = h_flat
 
+                if moe_m.cold_drop_weight > 0.0:
+                    sel_idx, rw = moe_m.prune_cold_l3_routes(sel_idx, rw)
+
                 plan.topk_idx_bufs[r_idx].copy_(sel_idx)
                 plan.topk_w_bufs[r_idx].copy_(rw.float())
 

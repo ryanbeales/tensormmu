@@ -1248,6 +1248,18 @@ class GPUExpertTLBCache(nn.Module):
         return overflow
 
 
+def get_default_cold_drop_weight() -> float:
+    """Optional confidence-based L3 NVMe cold expert dropping threshold (`TMMU_COLD_DROP_WEIGHT`, default `0.0` off)."""
+    raw = os.environ.get("TMMU_COLD_DROP_WEIGHT", "").strip()
+    if not raw:
+        return 0.0
+    try:
+        v = float(raw)
+    except ValueError:
+        return 0.0
+    return max(0.0, min(0.20, v))
+
+
 class SparseMoETLBExperts(nn.Module):
     """Drop-in Zero-Skeleton Virtual Memory replacement for `Gemma4TextExperts` / `Qwen3NextExperts`."""
 
@@ -1287,6 +1299,7 @@ class SparseMoETLBExperts(nn.Module):
         self.mode = mode
         self.tlb_strategy = tlb_strategy
         self.use_fused_kernels = bool(use_fused_kernels)
+        self.cold_drop_weight: float = get_default_cold_drop_weight()
 
         # Cross-layer lookahead references (not registered as nn.Module children to avoid circular/state_dict bloat)
         self._lookahead_refs: Dict[str, Any] = {"head": None, "target": None}
@@ -1399,6 +1412,34 @@ class SparseMoETLBExperts(nn.Module):
             else:
                 self.tlb_cache.clear_cache()
         self.tlb_cache.reset_telemetry()
+
+    def prune_cold_l3_routes(
+        self,
+        selected_experts: torch.Tensor,
+        routing_weights: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Drops tiny-weight L3 NVMe cold misses (`slot == -1`, `w_norm < cold_drop_weight`) on GPU with zero syncs."""
+        thresh = self.cold_drop_weight
+        if (
+            thresh <= 0.0
+            or self.mode != "vm_paged"
+            or self.tlb_cache.all_experts_mapped
+            or not self.tlb_cache._is_allocated
+            or int(selected_experts.shape[0]) > MAX_FUSED_DECODE_TOKENS
+        ):
+            return selected_experts, routing_weights
+        slots_sel = self.tlb_cache.gpu_expert_to_slot[selected_experts]  # [T, K] int32 (-1 = L3 NVMe miss)
+        w_sum = routing_weights.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        w_norm = routing_weights / w_sum
+        top1_pos = w_norm.argmax(dim=-1, keepdim=True)
+        top1_exp = selected_experts.gather(1, top1_pos)
+        is_top1 = torch.zeros_like(w_norm, dtype=torch.bool).scatter_(1, top1_pos, True)
+        drop_mask = (slots_sel == -1) & (w_norm < thresh) & (~is_top1)
+        new_exp = torch.where(drop_mask, top1_exp.expand_as(selected_experts), selected_experts)
+        new_w = torch.where(drop_mask, torch.zeros_like(routing_weights), routing_weights)
+        new_sum = new_w.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        new_w = (new_w * (w_sum / new_sum)).to(routing_weights.dtype)
+        return new_exp, new_w
 
     def sync_indices_for_step(
         self,
@@ -2025,6 +2066,8 @@ def install_moe_intra_layer_overlap(decoder_layer: nn.Module) -> bool:
             T_cur = int(hidden_states_flat.shape[0])
 
             _, top_k_weights, top_k_index = self.router(hidden_states_flat)
+            if self.experts.cold_drop_weight > 0.0 and T_cur <= MAX_FUSED_DECODE_TOKENS:
+                top_k_index, top_k_weights = self.experts.prune_cold_l3_routes(top_k_index, top_k_weights)
             pred_next_idx = (
                 self.experts.compute_lookahead_indices(hidden_states_flat)
                 if self.experts.has_active_lookahead(T_cur)
@@ -2076,6 +2119,8 @@ def install_moe_intra_layer_overlap(decoder_layer: nn.Module) -> bool:
             T_cur = int(hidden_states_reshaped.shape[0])
 
             _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+            if self.experts.cold_drop_weight > 0.0 and T_cur <= MAX_FUSED_DECODE_TOKENS:
+                selected_experts, routing_weights = self.experts.prune_cold_l3_routes(selected_experts, routing_weights)
             pred_next_idx = (
                 self.experts.compute_lookahead_indices(hidden_states_reshaped)
                 if self.experts.has_active_lookahead(T_cur)
