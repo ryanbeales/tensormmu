@@ -402,8 +402,9 @@ class TensorMMUEngine:
                     lut_pool=lut_pool,
                 )
 
+            req_draft = draft_mode if draft_mode is not None else self.draft_mode
             native_mtp: Optional[NativeMTPModule] = None
-            if NativeMTPModule.has_saved_mtp(cart_dir):
+            if req_draft != "none" and NativeMTPModule.has_saved_mtp(cart_dir):
                 native_mtp = NativeMTPModule.load_from_cartridge(
                     cartridge_dir=cart_dir,
                     main_model=model,
@@ -424,7 +425,6 @@ class TensorMMUEngine:
                 if runner_init is not None:
                     runner_init.invalidate_graphs()
 
-            req_draft = draft_mode if draft_mode is not None else self.draft_mode
             if req_draft == "mtp_only" and native_mtp is None:
                 eff_draft = "none"
             elif req_draft in ("two_tier", "eagle_only") and draft_head is None and native_mtp is None:

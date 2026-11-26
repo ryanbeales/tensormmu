@@ -487,18 +487,20 @@ class NativeMTPModule(nn.Module):
             meta = json.load(f)
 
         dev = torch.device(device)
-        # Clone a full-attention decoder layer skeleton from `main_model` to host `mtp.layers.0`
+        # Instantiate a fresh 0-byte `meta` full-attention decoder layer skeleton (never deepcopy live ctypes!)
         from decompiler.nvm_serializer import _get_parent_and_attr, _set_tensor_by_qualname, resolve_decoder_layers
 
         dec_layers = resolve_decoder_layers(main_model)
-        full_attn_src = None
-        for lyr in dec_layers:
+        full_attn_idx = len(dec_layers) - 1
+        full_attn_src = dec_layers[full_attn_idx]
+        for idx_l, lyr in enumerate(dec_layers):
             if hasattr(lyr, "self_attn") and lyr.self_attn is not None:
+                full_attn_idx = idx_l
                 full_attn_src = lyr
                 break
-        if full_attn_src is None:
-            full_attn_src = dec_layers[-1]
-        mtp_layer = copy.deepcopy(full_attn_src).to(device="meta")
+        text_cfg = getattr(main_model.config, "text_config", main_model.config)
+        with torch.device("meta"):
+            mtp_layer = type(full_attn_src)(text_cfg, layer_idx=full_attn_idx)
 
         core_sd = load_file(core_path, device="cpu")
         quant_meta: Dict[str, Dict[str, Any]] = meta.get("quant_linears", {})

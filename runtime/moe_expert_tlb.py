@@ -1888,11 +1888,18 @@ def auto_configure_moe_l2_zero_copy(
         try:
             import ctypes
 
-            h_proc = ctypes.windll.kernel32.GetCurrentProcess()
-            if hasattr(ctypes.windll.kernel32, "K32EmptyWorkingSet"):
-                ctypes.windll.kernel32.K32EmptyWorkingSet(h_proc)
+            k32 = ctypes.windll.kernel32
+            k32.GetCurrentProcess.restype = ctypes.c_void_p
+            h_proc = k32.GetCurrentProcess()
+            if hasattr(k32, "K32EmptyWorkingSet"):
+                k32.K32EmptyWorkingSet.argtypes = [ctypes.c_void_p]
+                k32.K32EmptyWorkingSet.restype = ctypes.c_int
+                k32.K32EmptyWorkingSet(h_proc)
             else:
-                ctypes.windll.psapi.EmptyWorkingSet(h_proc)
+                psapi = ctypes.windll.psapi
+                psapi.EmptyWorkingSet.argtypes = [ctypes.c_void_p]
+                psapi.EmptyWorkingSet.restype = ctypes.c_int
+                psapi.EmptyWorkingSet(h_proc)
         except Exception:
             pass
 

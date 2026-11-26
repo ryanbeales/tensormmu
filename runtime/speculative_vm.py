@@ -472,7 +472,7 @@ class SpeculativeVMGenerator:
         min_cum_prob: float = 0.01,
         confidence_gated_moe: bool = True,
     ) -> None:
-        if draft_mode not in ("none", "pld_only", "eagle_only", "two_tier"):
+        if draft_mode not in ("none", "pld_only", "eagle_only", "mtp_only", "two_tier"):
             raise ValueError(f"Unsupported draft_mode '{draft_mode}'.")
         self.model = model
         self.tokenizer = tokenizer
