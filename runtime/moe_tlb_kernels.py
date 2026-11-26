@@ -19,6 +19,7 @@ Bit-Exact Multi-Wave Grouped Prefill (`T > 8`, eliminating ~360k Python kernel l
 from __future__ import annotations
 
 import ctypes
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import torch
@@ -133,7 +134,7 @@ class ContiguousExpertPageLayout:
 
 @dataclass(frozen=True)
 class WINAExpertPageLayout:
-    """4KB-aligned neuron-major `UINT4-WINA` L2 Zero-Copy expert page layout (`gate` + `wina_norms` + `(up_j, down_j)`)."""
+    """4KB-aligned neuron-major `UINT4-WINA` / `UINT3-WINA` L2 Zero-Copy expert page layout (`gate` + `wina_norms` + `(up_j, down_j)`)."""
 
     d_model: int
     d_ffn: int
@@ -144,15 +145,20 @@ class WINAExpertPageLayout:
     off_wina_norm: int
     off_slabs: int
     page_bytes: int
+    bits: int = 4
 
     @classmethod
-    def compute(cls, d_model: int, d_ffn: int) -> "WINAExpertPageLayout":
+    def compute(cls, d_model: int, d_ffn: int, bits: int = 4) -> "WINAExpertPageLayout":
         d_m = int(d_model)
         d_i = int(d_ffn)
+        b = 3 if int(bits) == 3 else 4
         assert d_m % 64 == 0, f"WINAExpertPageLayout requires d_model % 64 == 0, got {d_m}"
         n_groups = d_m // 64
-        # Per-row layout: [n_groups * 32 B of UINT4] + [n_groups * 4 B of packed (wmin_bf16, scale_bf16)]
-        row_b = _align_up(n_groups * 36, SUBTENSOR_ALIGN_BYTES)
+        # Per-row layout (128B GPU cacheline aligned — zero 256B padding waste!):
+        #   bits=4: [n_groups * 32 B of UINT4] + [n_groups * 4 B of (wmin_bf16, scale_bf16)] = n_groups * 36 B
+        #   bits=3: [n_groups * 24 B of packed UINT3 (32w -> 3 uint32)] + [n_groups * 4 B of (wmin_bf16, scale_bf16)] = n_groups * 28 B
+        bytes_per_grp = 28 if b == 3 else 36
+        row_b = _align_up(n_groups * bytes_per_grp, 128)
         slab_b = 2 * row_b  # [up_row[j], down_col[j]] contiguous per intermediate neuron j
         off_gate = 0
         off_wina = _align_up(d_i * row_b, SUBTENSOR_ALIGN_BYTES)
@@ -168,6 +174,7 @@ class WINAExpertPageLayout:
             off_wina_norm=off_wina,
             off_slabs=off_slabs,
             page_bytes=page_b,
+            bits=b,
         )
 
 
@@ -960,6 +967,203 @@ extern "C" __global__ void moe_wina_up_down_q4_kernel(
         }
     }
 }
+
+// =============================================================================
+// UINT3-WINA Cold L2 Zero-Copy Kernels (exact 3.0 bits/weight: 32w -> 3 uint32)
+// 30% smaller L2 pages than legacy UINT4-WINA -> +43% more experts in Host RAM!
+// =============================================================================
+__device__ __forceinline__ float wina_dot_q3_grp64_bf16(
+    const uint2* __restrict__ q3_g,
+    unsigned int mn_sc,
+    const bf16_t* __restrict__ xp
+) {
+    float mn = bf16_to_f32((bf16_t)(mn_sc & 0xFFFFU));
+    float sc = bf16_to_f32((bf16_t)(mn_sc >> 16));
+    uint2 v0 = __ldg(&q3_g[0]);
+    uint2 v1 = __ldg(&q3_g[1]);
+    uint2 v2 = __ldg(&q3_g[2]);
+    unsigned int w[6] = {v0.x, v0.y, v1.x, v1.y, v2.x, v2.y};
+    float qdot = 0.0f;
+    float xsum = 0.0f;
+    #pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        unsigned int u0 = w[h * 3 + 0];
+        unsigned int u1 = w[h * 3 + 1];
+        unsigned int u2 = w[h * 3 + 2];
+        const bf16_t* xh = xp + (h << 5);
+        #pragma unroll
+        for (int i = 0; i < 10; ++i) {
+            float xv = bf16_to_f32(__ldg(&xh[i]));
+            xsum += xv;
+            qdot += (float)((u0 >> (i * 3)) & 7U) * xv;
+        }
+        {
+            float xv = bf16_to_f32(__ldg(&xh[10]));
+            xsum += xv;
+            unsigned int q10 = ((u0 >> 30) & 3U) | ((u1 & 1U) << 2);
+            qdot += (float)q10 * xv;
+        }
+        #pragma unroll
+        for (int i = 0; i < 10; ++i) {
+            float xv = bf16_to_f32(__ldg(&xh[11 + i]));
+            xsum += xv;
+            qdot += (float)((u1 >> (1 + i * 3)) & 7U) * xv;
+        }
+        {
+            float xv = bf16_to_f32(__ldg(&xh[21]));
+            xsum += xv;
+            unsigned int q21 = ((u1 >> 31) & 1U) | ((u2 & 3U) << 1);
+            qdot += (float)q21 * xv;
+        }
+        #pragma unroll
+        for (int i = 0; i < 10; ++i) {
+            float xv = bf16_to_f32(__ldg(&xh[22 + i]));
+            xsum += xv;
+            qdot += (float)((u2 >> (2 + i * 3)) & 7U) * xv;
+        }
+    }
+    return qdot * sc + xsum * mn;
+}
+
+extern "C" __global__ void moe_wina_gate_q3_kernel(
+    const bf16_t* __restrict__ x_in,
+    const uint8_t* __restrict__ l2_wina_pages,
+    const int* __restrict__ wina_l2_slots,
+    const int* __restrict__ wina_l2_tok_ids,
+    const int* __restrict__ wina_num_l2_ptr,
+    float* __restrict__ gate_act_out,
+    float* __restrict__ wina_score_out,
+    int d_model,
+    int d_ffn,
+    int n_groups_d,
+    int row_bytes,
+    int page_bytes,
+    int off_gate,
+    int off_wina_norm,
+    int act_kind
+) {
+    const int a = blockIdx.y;
+    if (a >= *wina_num_l2_ptr) return;
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int row = blockIdx.x * 4 + warp;
+    if (row >= d_ffn) return;
+
+    const int l2_idx = wina_l2_slots[a];
+    const int t = wina_l2_tok_ids[a];
+    const bf16_t* xt = x_in + (size_t)t * (size_t)d_model;
+    const uint8_t* page = l2_wina_pages + (size_t)l2_idx * (size_t)page_bytes;
+    const uint8_t* row_ptr = page + off_gate + (size_t)row * (size_t)row_bytes;
+    const float dn_norm = bf16_to_f32(__ldg(&((const bf16_t*)(page + off_wina_norm))[row]));
+
+    const uint2* q3_base = (const uint2*)row_ptr;
+    const unsigned int* ms_base = (const unsigned int*)(row_ptr + n_groups_d * 24);
+    float acc = 0.0f;
+    for (int g = lane; g < n_groups_d; g += 32) {
+        acc += wina_dot_q3_grp64_bf16(q3_base + g * 3, __ldg(&ms_base[g]), xt + (g << 6));
+    }
+
+    float g_val = warp_sum(acc);
+    if (lane == 0) {
+        float ga = apply_moe_act(g_val, act_kind);
+        gate_act_out[(size_t)a * (size_t)d_ffn + row] = ga;
+        wina_score_out[(size_t)a * (size_t)d_ffn + row] = fabsf(ga) * dn_norm;
+    }
+}
+
+extern "C" __global__ void moe_wina_up_down_q3_kernel(
+    const bf16_t* __restrict__ x_in,
+    const uint8_t* __restrict__ l2_wina_pages,
+    const int* __restrict__ wina_l2_slots,
+    const int* __restrict__ wina_l2_tok_ids,
+    const int* __restrict__ wina_l2_pair_ids,
+    const float* __restrict__ wina_l2_weights,
+    const int* __restrict__ wina_num_l2_ptr,
+    const float* __restrict__ gate_act,
+    const int* __restrict__ active_neurons,
+    float* __restrict__ partial_f32,
+    int d_model,
+    int d_ffn,
+    int k_keep,
+    int n_groups_d,
+    int row_bytes,
+    int slab_bytes,
+    int page_bytes,
+    int off_slabs
+) {
+    const int a = blockIdx.y;
+    if (a >= *wina_num_l2_ptr) return;
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int slot_k = blockIdx.x * 4 + warp;
+    if (slot_k >= k_keep) return;
+
+    const int j = (k_keep < d_ffn) ? active_neurons[(size_t)a * (size_t)k_keep + slot_k] : slot_k;
+    const int l2_idx = wina_l2_slots[a];
+    const int t = wina_l2_tok_ids[a];
+    const int pair_id = wina_l2_pair_ids[a];
+    const bf16_t* xt = x_in + (size_t)t * (size_t)d_model;
+    const uint8_t* page = l2_wina_pages + (size_t)l2_idx * (size_t)page_bytes;
+    const uint8_t* slab = page + off_slabs + (size_t)j * (size_t)slab_bytes;
+
+    const uint2* up_q3 = (const uint2*)slab;
+    const unsigned int* up_ms = (const unsigned int*)(slab + n_groups_d * 24);
+    float u_acc = 0.0f;
+    for (int g = lane; g < n_groups_d; g += 32) {
+        u_acc += wina_dot_q3_grp64_bf16(up_q3 + g * 3, __ldg(&up_ms[g]), xt + (g << 6));
+    }
+
+    float u_val = warp_sum(u_acc);
+    u_val = __shfl_sync(0xffffffffU, u_val, 0);
+    const float coeff = gate_act[(size_t)a * (size_t)d_ffn + j] * u_val * wina_l2_weights[a];
+
+    const uint8_t* dn_ptr = slab + row_bytes;
+    const uint2* dn_q3 = (const uint2*)dn_ptr;
+    const unsigned int* dn_ms = (const unsigned int*)(dn_ptr + n_groups_d * 24);
+    float* dst_row = partial_f32 + (size_t)pair_id * (size_t)d_model;
+
+    for (int g = lane; g < n_groups_d; g += 32) {
+        unsigned int mn_sc = __ldg(&dn_ms[g]);
+        const float mn_c = bf16_to_f32((bf16_t)(mn_sc & 0xFFFFU)) * coeff;
+        const float sc_c = bf16_to_f32((bf16_t)(mn_sc >> 16)) * coeff;
+        uint2 v0 = __ldg(&dn_q3[g * 3 + 0]);
+        uint2 v1 = __ldg(&dn_q3[g * 3 + 1]);
+        uint2 v2 = __ldg(&dn_q3[g * 3 + 2]);
+        unsigned int w[6] = {v0.x, v0.y, v1.x, v1.y, v2.x, v2.y};
+        float* yp = dst_row + (g << 6);
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            unsigned int u0 = w[h * 3 + 0];
+            unsigned int u1 = w[h * 3 + 1];
+            unsigned int u2 = w[h * 3 + 2];
+            float* yh = yp + (h << 5);
+            #pragma unroll
+            for (int i = 0; i < 10; ++i) {
+                atomicAdd(&yh[i], (float)((u0 >> (i * 3)) & 7U) * sc_c + mn_c);
+            }
+            {
+                unsigned int q10 = ((u0 >> 30) & 3U) | ((u1 & 1U) << 2);
+                atomicAdd(&yh[10], (float)q10 * sc_c + mn_c);
+            }
+            #pragma unroll
+            for (int i = 0; i < 10; ++i) {
+                atomicAdd(&yh[11 + i], (float)((u1 >> (1 + i * 3)) & 7U) * sc_c + mn_c);
+            }
+            {
+                unsigned int q21 = ((u1 >> 31) & 1U) | ((u2 & 3U) << 1);
+                atomicAdd(&yh[21], (float)q21 * sc_c + mn_c);
+            }
+            #pragma unroll
+            for (int i = 0; i < 10; ++i) {
+                atomicAdd(&yh[22 + i], (float)((u2 >> (2 + i * 3)) & 7U) * sc_c + mn_c);
+            }
+        }
+    }
+}
 """
 
 _MOE_KERNELS_BY_DEVICE: Dict[int, Dict[str, Any]] = {}
@@ -1008,6 +1212,8 @@ def get_or_compile_moe_tlb_kernels(device: torch.device) -> Dict[str, Any]:
             "moe_wina_gate_q4_kernel",
             "moe_wina_select_top_kernel",
             "moe_wina_up_down_q4_kernel",
+            "moe_wina_gate_q3_kernel",
+            "moe_wina_up_down_q3_kernel",
         ]
         kd = _cuda_load_module(cubin_buf.raw, names)
         kd["moe_uint4_gate_up_act_kernel"].set_shared_memory_config(65536)
@@ -1317,6 +1523,7 @@ class MoETLBLayerLauncher:
         num_experts: int,
         layout: ContiguousExpertPageLayout,
         act_kind: int,
+        wina_layout: Optional[WINAExpertPageLayout] = None,
     ) -> None:
         self.device = device
         self.num_experts = int(num_experts)
@@ -1342,8 +1549,15 @@ class MoETLBLayerLauncher:
         self._total_elems = ctypes.c_int(layout.d_model)
         self._zero_elems = ctypes.c_int(layout.d_model)
         self._wina_k_keep = ctypes.c_int(max(1, layout.d_ffn // 2))
+        default_wina_bits = 3 if os.environ.get("TMMU_L2_WINA_BITS", "4").strip() == "3" else 4
         self.wina_layout: Optional[WINAExpertPageLayout] = (
-            WINAExpertPageLayout.compute(layout.d_model, layout.d_ffn) if (layout.d_model % 64 == 0) else None
+            wina_layout
+            if wina_layout is not None
+            else (
+                WINAExpertPageLayout.compute(layout.d_model, layout.d_ffn, bits=default_wina_bits)
+                if (layout.d_model % 64 == 0)
+                else None
+            )
         )
 
         self._grid_gu_x = (layout.d_ffn + 3) // 4
@@ -1614,9 +1828,12 @@ class MoETLBLayerLauncher:
                 self._kd["moe_uint4_down_accum_kernel"].func,
                 self._grid_dn_x, max_u, 1, 128, 1, 1, smem_bytes, stream_h, self._args_dn, None,
             )
-            # L2 Zero-Copy hits (`slot <= -2`) run Gate-First `UINT4-WINA` conditional fetch
+            # L2 Zero-Copy hits (`slot <= -2`) run Gate-First `UINT4-WINA` or `UINT3-WINA` conditional fetch
+            is_q3 = self.wina_layout.bits == 3
+            gate_k_name = "moe_wina_gate_q3_kernel" if is_q3 else "moe_wina_gate_q4_kernel"
+            ud_k_name = "moe_wina_up_down_q3_kernel" if is_q3 else "moe_wina_up_down_q4_kernel"
             rw0 = libcuda.cuLaunchKernel(
-                self._kd["moe_wina_gate_q4_kernel"].func,
+                self._kd[gate_k_name].func,
                 self._grid_gu_x, max_l2_pairs, 1, 128, 1, 1, 0, stream_h, self._args_wina_gate, None,
             )
             rw1 = 0
@@ -1626,7 +1843,7 @@ class MoETLBLayerLauncher:
                     max_l2_pairs, 1, 1, 256, 1, 1, 0, stream_h, self._args_wina_sel, None,
                 )
             rw2 = libcuda.cuLaunchKernel(
-                self._kd["moe_wina_up_down_q4_kernel"].func,
+                self._kd[ud_k_name].func,
                 (k_keep + 3) // 4, max_l2_pairs, 1, 128, 1, 1, 0, stream_h, self._args_wina_ud, None,
             )
             grid_ep = (tot_el + 255) // 256

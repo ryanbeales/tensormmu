@@ -526,6 +526,14 @@ class TensorMMUEngine:
         l2_wina_ratio = (
             float(getattr(first_layer.tlb_cache, "wina_keep_ratio", 1.0)) if l2_wina_active else 1.0
         )
+        l2_wina_bits = (
+            int(getattr(first_layer.tlb_cache.wina_layout, "bits", 4))
+            if (l2_wina_active and getattr(first_layer.tlb_cache, "wina_layout", None) is not None)
+            else 4
+        )
+        cold_drop_weight = (
+            float(getattr(first_layer, "cold_drop_weight", 0.0)) if first_layer is not None else 0.0
+        )
         l2_ram_gb = round(
             sum(getattr(m.tlb_cache, "total_l2_pinned_ram_bytes", 0) for m in self.paged_layers.values()) / (1024 ** 3),
             3,
@@ -557,6 +565,8 @@ class TensorMMUEngine:
             "l2_slots": l2_slots,
             "l2_wina_active": l2_wina_active,
             "l2_wina_ratio": l2_wina_ratio,
+            "l2_wina_bits": l2_wina_bits,
+            "cold_drop_weight": cold_drop_weight,
             "l2_ram_gb": l2_ram_gb,
             "all_experts_mapped": all_mapped,
             "cuda_graph_mode": graph_mode,

@@ -127,6 +127,8 @@ def _cmd_compile(args: argparse.Namespace) -> int:
 
 def _cmd_serve(args: argparse.Namespace) -> int:
     os.environ["TMMU_L2_WINA_RATIO"] = str(max(0.20, min(1.0, float(args.l2_wina_ratio))))
+    os.environ["TMMU_L2_WINA_BITS"] = str(3 if int(args.l2_wina_bits) == 3 else 4)
+    os.environ["TMMU_COLD_DROP_WEIGHT"] = str(max(0.0, min(0.20, float(args.cold_drop_weight))))
     model_spec = args.model or args.nvm_dir or os.environ.get("TMMU_MODEL", "").strip()
     if not model_spec:
         picked = pick_default_cartridge(args.checkpoints_dir)
@@ -287,7 +289,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--l2-wina-ratio",
         type=float,
         default=float(os.environ.get("TMMU_L2_WINA_RATIO", "0.50")),
-        help="Active neuron keep ratio for L2 Zero-Copy `UINT4-WINA` (default: 0.50; set 1.0 to disable).",
+        help="Active neuron keep ratio for L2 Zero-Copy `UINT4-WINA`/`UINT3-WINA` (default: 0.50; set 1.0 to disable).",
+    )
+    p_srv.add_argument(
+        "--l2-wina-bits",
+        type=int,
+        choices=[3, 4],
+        default=int(os.environ.get("TMMU_L2_WINA_BITS", "4")),
+        help="Bit-width for L2 Zero-Copy WINA pages: 4 (`UINT4-WINA`) or 3 (`UINT3-WINA`, -30%% RAM & +43%% L2 capacity).",
+    )
+    p_srv.add_argument(
+        "--cold-drop-weight",
+        type=float,
+        default=float(os.environ.get("TMMU_COLD_DROP_WEIGHT", "0.06")),
+        help="Drop unmapped L3 NVMe cold experts below this normalized router weight (default: 0.06; 0.0 = exact, 0.09 = max speed).",
     )
     p_srv.add_argument("--tlb-strategy", type=str, default=os.environ.get("TMMU_TLB_STRATEGY") or None)
     p_srv.add_argument(

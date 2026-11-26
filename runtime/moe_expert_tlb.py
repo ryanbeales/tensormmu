@@ -235,6 +235,8 @@ def repack_uint4_page_to_wina_q4(
     Preserves `gate_proj` and `up_proj` `UINT4` weights bit-for-bit, computes exact WINA column norms
     `||W_down[:, j]||_2`, and packs `(up_row[j], down_col[j])` contiguously per intermediate neuron `j`.
     """
+    if wina_layout.bits == 3:
+        return repack_uint4_page_to_wina_q3(page_u8_cpu_or_gpu, layout, wina_layout, device, lut_uint4=lut_uint4)
     pg = page_u8_cpu_or_gpu.to(device=device, non_blocking=False)
     d_i = layout.d_ffn
     two_i = 2 * d_i
@@ -304,6 +306,114 @@ def repack_uint4_page_to_wina_q4(
     slabs = torch.cat([up_rows, dn_rows], dim=1)  # [d_ffn, 2 * row_bytes]
     out_pg[wina_layout.off_slabs : wina_layout.off_slabs + d_i * wina_layout.slab_bytes].copy_(slabs.reshape(-1))
     return out_pg.cpu()
+
+
+def _quantize_uint3_2d_packed(w_f32: torch.Tensor, group_size: int = 64) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantizes `[R, C]` FP32 to asymmetric `UINT3` (`0..7`, `gs=64`), packing 32 weights -> 3 `uint32` words (24B/grp)."""
+    R, C = int(w_f32.shape[0]), int(w_f32.shape[1])
+    n_g = C // group_size
+    wg = w_f32.view(R, n_g, group_size)
+    wmin = wg.amin(dim=-1, keepdim=True)
+    wmax = wg.amax(dim=-1, keepdim=True)
+    sc = ((wmax - wmin) / 7.0).clamp(min=1e-8)
+    wmin_bf = wmin.to(torch.bfloat16)
+    sc_bf = sc.to(torch.bfloat16)
+    q = torch.round((wg - wmin_bf.float()) / sc_bf.float().clamp(min=1e-8)).clamp(0, 7).to(torch.int64)
+    # Pack 2 halves of 32 weights per group -> 3 uint32 words per half (6 uint32 = 24 bytes per 64-weight group)
+    qh = q.view(R, n_g, 2, 32)
+    u0 = torch.zeros((R, n_g, 2), dtype=torch.int64, device=w_f32.device)
+    u1 = torch.zeros((R, n_g, 2), dtype=torch.int64, device=w_f32.device)
+    u2 = torch.zeros((R, n_g, 2), dtype=torch.int64, device=w_f32.device)
+    for i in range(10):
+        u0 |= qh[..., i] << (i * 3)
+        u1 |= qh[..., 11 + i] << (1 + i * 3)
+        u2 |= qh[..., 22 + i] << (2 + i * 3)
+    u0 |= (qh[..., 10] & 3) << 30
+    u1 |= (qh[..., 10] >> 2) | ((qh[..., 21] & 1) << 31)
+    u2 |= qh[..., 21] >> 1
+    words_i32 = torch.stack([u0, u1, u2], dim=-1).bitwise_and(0xFFFFFFFF).to(torch.int32).contiguous()
+    pk_u8 = words_i32.view(torch.uint8).reshape(R, n_g * 24)
+    return pk_u8, wmin_bf.squeeze(-1), sc_bf.squeeze(-1)
+
+
+def repack_uint4_page_to_wina_q3(
+    page_u8_cpu_or_gpu: torch.Tensor,
+    layout: ContiguousExpertPageLayout,
+    wina_layout: WINAExpertPageLayout,
+    device: torch.device,
+    lut_uint4: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Repacks an existing `ContiguousExpertPageLayout` page into 3-bit neuron-major `UINT3-WINA` format on GPU."""
+    pg = page_u8_cpu_or_gpu.to(device=device, non_blocking=False)
+    d_i = layout.d_ffn
+    two_i = 2 * d_i
+    n_gd = wina_layout.n_groups_d
+    n_q3_b = n_gd * 24
+
+    # 1. Dequantize `gate_proj` & `up_proj` from UINT4 -> re-quantize to packed UINT3 (24B/grp)
+    gu_q4 = pg[layout.off_gu_q4 : layout.off_gu_q4 + layout.bytes_gu_q4].view(two_i, layout.d_pad_half)
+    gu_wmin = pg[layout.off_gu_wmin : layout.off_gu_wmin + layout.bytes_gu_wmin].view(torch.bfloat16).view(two_i, layout.n_groups_d, 1)
+    gu_scale = pg[layout.off_gu_scale : layout.off_gu_scale + layout.bytes_gu_scale].view(torch.bfloat16).view(two_i, layout.n_groups_d, 1)
+    if lut_uint4 is not None:
+        gu_deq = (
+            F.embedding(gu_q4.to(torch.int32), lut_uint4.to(device=device)).view(two_i, layout.n_groups_d, layout.group_size)
+            * gu_scale
+            + gu_wmin
+        ).view(two_i, layout.d_pad)[:, : layout.d_model].float()
+    else:
+        lo = (gu_q4 & 0x0F).to(torch.bfloat16)
+        hi = ((gu_q4 >> 4) & 0x0F).to(torch.bfloat16)
+        gu_deq = (torch.stack([lo, hi], dim=-1).view(two_i, layout.n_groups_d, layout.group_size) * gu_scale + gu_wmin).view(
+            two_i, layout.d_pad
+        )[:, : layout.d_model].float()
+
+    gu_pk_u8, gu_mn_bf, gu_sc_bf = _quantize_uint3_2d_packed(gu_deq, group_size=64)
+    gu_ms_u8 = torch.stack([gu_mn_bf.view(torch.uint16), gu_sc_bf.view(torch.uint16)], dim=-1).view(torch.uint8).reshape(two_i, n_gd * 4)
+
+    gate_rows = torch.zeros((d_i, wina_layout.row_bytes), dtype=torch.uint8, device=device)
+    gate_rows[:, :n_q3_b].copy_(gu_pk_u8[:d_i])
+    gate_rows[:, n_q3_b : n_q3_b + n_gd * 4].copy_(gu_ms_u8[:d_i])
+
+    up_rows = torch.zeros((d_i, wina_layout.row_bytes), dtype=torch.uint8, device=device)
+    up_rows[:, :n_q3_b].copy_(gu_pk_u8[d_i:])
+    up_rows[:, n_q3_b : n_q3_b + n_gd * 4].copy_(gu_ms_u8[d_i:])
+
+    # 2. Dequantize `down_proj` -> compute WINA column norms + quantize column-major `down_col[j]` to UINT3
+    dn_q4 = pg[layout.off_dn_q4 : layout.off_dn_q4 + layout.bytes_dn_q4].view(layout.d_model, layout.i_pad_half)
+    dn_wmin = pg[layout.off_dn_wmin : layout.off_dn_wmin + layout.bytes_dn_wmin].view(torch.bfloat16).view(layout.d_model, layout.n_groups_i, 1)
+    dn_scale = pg[layout.off_dn_scale : layout.off_dn_scale + layout.bytes_dn_scale].view(torch.bfloat16).view(layout.d_model, layout.n_groups_i, 1)
+    if lut_uint4 is not None:
+        dn_deq = (
+            F.embedding(dn_q4.to(torch.int32), lut_uint4.to(device=device)).view(layout.d_model, layout.n_groups_i, layout.group_size)
+            * dn_scale
+            + dn_wmin
+        ).view(layout.d_model, layout.i_pad)[:, :d_i]
+    else:
+        lo = (dn_q4 & 0x0F).to(torch.bfloat16)
+        hi = ((dn_q4 >> 4) & 0x0F).to(torch.bfloat16)
+        dn_deq = (torch.stack([lo, hi], dim=-1).view(layout.d_model, layout.n_groups_i, layout.group_size) * dn_scale + dn_wmin).view(
+            layout.d_model, layout.i_pad
+        )[:, :d_i]
+
+    dn_col_norms = dn_deq.float().norm(dim=0).to(torch.bfloat16).contiguous()
+    dn_pk_u8, dn_mn_bf, dn_sc_bf = _quantize_uint3_2d_packed(dn_deq.T.float().contiguous(), group_size=64)
+    dn_ms_u8 = torch.stack([dn_mn_bf.view(torch.uint16), dn_sc_bf.view(torch.uint16)], dim=-1).view(torch.uint8).reshape(d_i, n_gd * 4)
+
+    dn_rows = torch.zeros((d_i, wina_layout.row_bytes), dtype=torch.uint8, device=device)
+    dn_rows[:, :n_q3_b].copy_(dn_pk_u8)
+    dn_rows[:, n_q3_b : n_q3_b + n_gd * 4].copy_(dn_ms_u8)
+
+    out_pg = torch.zeros((wina_layout.page_bytes,), dtype=torch.uint8, device=device)
+    out_pg[wina_layout.off_gate : wina_layout.off_gate + d_i * wina_layout.row_bytes].copy_(gate_rows.reshape(-1))
+    out_pg[wina_layout.off_wina_norm : wina_layout.off_wina_norm + d_i * 2].copy_(dn_col_norms.view(torch.uint8).reshape(-1))
+    slabs = torch.cat([up_rows, dn_rows], dim=1)
+    out_pg[wina_layout.off_slabs : wina_layout.off_slabs + d_i * wina_layout.slab_bytes].copy_(slabs.reshape(-1))
+    return out_pg.cpu()
+
+
+def get_default_l2_wina_bits() -> int:
+    raw = os.environ.get("TMMU_L2_WINA_BITS", "4").strip()
+    return 3 if raw == "3" else 4
 
 
 def get_default_l2_wina_ratio() -> float:
@@ -385,7 +495,9 @@ class GPUExpertTLBCache(nn.Module):
         self.l2_wina_dev_ptr: int = 0
         self._l2_zc_handle: Optional[PinnedZeroCopyBuffer] = None
         self.wina_layout: Optional[WINAExpertPageLayout] = (
-            WINAExpertPageLayout.compute(layout.d_model, layout.d_ffn) if (layout.d_model % 64 == 0) else None
+            WINAExpertPageLayout.compute(layout.d_model, layout.d_ffn, bits=get_default_l2_wina_bits())
+            if (layout.d_model % 64 == 0)
+            else None
         )
         self.wina_keep_ratio: float = get_default_l2_wina_ratio()
         self._l2_lut_uint4: Optional[torch.Tensor] = None
@@ -530,7 +642,10 @@ class GPUExpertTLBCache(nn.Module):
         eff_ratio = self.wina_keep_ratio if wina_keep_ratio is None else max(0.20, min(1.0, float(wina_keep_ratio)))
         if lut_uint4 is not None:
             self._l2_lut_uint4 = lut_uint4
-        use_wina = (0.0 < eff_ratio < 1.0) and (self.wina_layout is not None)
+        use_wina = (
+            self.wina_layout is not None
+            and ((0.0 < eff_ratio < 1.0) or self.wina_layout.bits == 3)
+        )
 
         max_useful = max(0, self.num_experts - self.tlb_slots)
         target = int(max(0, min(l2_slots, max_useful)))
@@ -1249,14 +1364,14 @@ class GPUExpertTLBCache(nn.Module):
 
 
 def get_default_cold_drop_weight() -> float:
-    """Optional confidence-based L3 NVMe cold expert dropping threshold (`TMMU_COLD_DROP_WEIGHT`, default `0.0` off)."""
+    """Confidence-based L3 NVMe cold expert dropping threshold (`TMMU_COLD_DROP_WEIGHT`, default `0.06`; `0.0` disables)."""
     raw = os.environ.get("TMMU_COLD_DROP_WEIGHT", "").strip()
     if not raw:
-        return 0.0
+        return 0.06
     try:
         v = float(raw)
     except ValueError:
-        return 0.0
+        return 0.06
     return max(0.0, min(0.20, v))
 
 
@@ -1965,7 +2080,7 @@ def auto_configure_moe_l2_zero_copy(
 
     avail_bytes, total_bytes = query_available_system_ram_bytes()
     eff_wina = get_default_l2_wina_ratio() if wina_keep_ratio is None else max(0.20, min(1.0, float(wina_keep_ratio)))
-    use_wina = 0.0 < eff_wina < 1.0
+    use_wina = (0.0 < eff_wina < 1.0) or (first.tlb_cache.wina_layout is not None and first.tlb_cache.wina_layout.bits == 3)
 
     def _eff_page_bytes(m: SparseMoETLBExperts) -> int:
         if use_wina and m.tlb_cache.wina_layout is not None:
@@ -1998,11 +2113,12 @@ def auto_configure_moe_l2_zero_copy(
     else:
         if total_unmapped_bytes <= budget_bytes:
             cap_bytes = total_unmapped_bytes
-        elif os.name == "nt" and total_bytes > 0:
-            # Windows WDDM pinned-memory commit ceiling (~38% of physical RAM) so `cudaMalloc` never OOMs after L2 pin
-            cap_bytes = int(0.38 * float(total_bytes))
         else:
             cap_bytes = budget_bytes
+        if os.name == "nt" and total_bytes > 0:
+            # Windows WDDM hard page-locked ceiling is ~47% of physical RAM (~15 GiB on 32 GiB);
+            # cap at 40% (~12.8 GiB on 32 GiB, ~25.6 GiB on 64 GiB) so ALL layers allocate evenly!
+            cap_bytes = min(cap_bytes, int(0.40 * float(total_bytes)))
 
     eff_budget = min(budget_bytes, cap_bytes)
     if bytes_per_slot_across_model <= 0 or eff_budget < bytes_per_slot_across_model:
