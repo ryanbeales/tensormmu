@@ -126,6 +126,7 @@ def _cmd_compile(args: argparse.Namespace) -> int:
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
+    os.environ["TMMU_L2_WINA_RATIO"] = str(max(0.20, min(1.0, float(args.l2_wina_ratio))))
     model_spec = args.model or args.nvm_dir or os.environ.get("TMMU_MODEL", "").strip()
     if not model_spec:
         picked = pick_default_cartridge(args.checkpoints_dir)
@@ -282,6 +283,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["vm_paged", "all_resident"],
     )
     p_srv.add_argument("--tlb-slots", type=int, default=_env_int_opt("TMMU_TLB_SLOTS"))
+    p_srv.add_argument(
+        "--l2-wina-ratio",
+        type=float,
+        default=float(os.environ.get("TMMU_L2_WINA_RATIO", "0.50")),
+        help="Active neuron keep ratio for L2 Zero-Copy `UINT4-WINA` (default: 0.50; set 1.0 to disable).",
+    )
     p_srv.add_argument("--tlb-strategy", type=str, default=os.environ.get("TMMU_TLB_STRATEGY") or None)
     p_srv.add_argument(
         "--page-storage",

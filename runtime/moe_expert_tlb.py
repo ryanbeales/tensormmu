@@ -34,6 +34,7 @@ from runtime.moe_tlb_kernels import (
     MoETLBLayerLauncher,
     PREFILL_MAX_CHUNK_TOKENS,
     PREFILL_STAGE_SLOTS,
+    WINAExpertPageLayout,
     get_shared_moe_workspace,
     get_zero_copy_device_ptr,
     query_available_system_ram_bytes,
@@ -219,6 +220,99 @@ def unpack_moe_expert_page_to_bf16(
     return gu_deq, dn_deq
 
 
+@torch.no_grad()
+def repack_uint4_page_to_wina_q4(
+    page_u8_cpu_or_gpu: torch.Tensor,
+    layout: ContiguousExpertPageLayout,
+    wina_layout: WINAExpertPageLayout,
+    device: torch.device,
+    lut_uint4: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Repacks an existing `ContiguousExpertPageLayout` page into neuron-major `UINT4-WINA` format on GPU.
+
+    Preserves `gate_proj` and `up_proj` `UINT4` weights bit-for-bit, computes exact WINA column norms
+    `||W_down[:, j]||_2`, and packs `(up_row[j], down_col[j])` contiguously per intermediate neuron `j`.
+    """
+    pg = page_u8_cpu_or_gpu.to(device=device, non_blocking=False)
+    d_i = layout.d_ffn
+    two_i = 2 * d_i
+    n_gd = wina_layout.n_groups_d
+    n_q4_b = n_gd * 32
+
+    # 1. Reuse exact `gate_proj` & `up_proj` UINT4 nibbles + scales (0 re-quantization loss!)
+    gu_q4 = pg[layout.off_gu_q4 : layout.off_gu_q4 + layout.bytes_gu_q4].view(two_i, layout.d_pad_half)[:, :n_q4_b]
+    gu_wmin = (
+        pg[layout.off_gu_wmin : layout.off_gu_wmin + layout.bytes_gu_wmin]
+        .view(torch.uint16)
+        .view(two_i, layout.n_groups_d)[:, :n_gd]
+    )
+    gu_scale = (
+        pg[layout.off_gu_scale : layout.off_gu_scale + layout.bytes_gu_scale]
+        .view(torch.uint16)
+        .view(two_i, layout.n_groups_d)[:, :n_gd]
+    )
+    gu_ms_u8 = torch.stack([gu_wmin, gu_scale], dim=-1).view(torch.uint8).reshape(two_i, n_gd * 4)
+
+    gate_rows = torch.zeros((d_i, wina_layout.row_bytes), dtype=torch.uint8, device=device)
+    gate_rows[:, :n_q4_b].copy_(gu_q4[:d_i])
+    gate_rows[:, n_q4_b : n_q4_b + n_gd * 4].copy_(gu_ms_u8[:d_i])
+
+    up_rows = torch.zeros((d_i, wina_layout.row_bytes), dtype=torch.uint8, device=device)
+    up_rows[:, :n_q4_b].copy_(gu_q4[d_i:])
+    up_rows[:, n_q4_b : n_q4_b + n_gd * 4].copy_(gu_ms_u8[d_i:])
+
+    # 2. Dequantize `down_proj` -> compute WINA column norms + quantize column-major `down_col[j]` (`[d_ffn, d_model]`)
+    dn_q4 = pg[layout.off_dn_q4 : layout.off_dn_q4 + layout.bytes_dn_q4].view(layout.d_model, layout.i_pad_half)
+    dn_wmin = (
+        pg[layout.off_dn_wmin : layout.off_dn_wmin + layout.bytes_dn_wmin]
+        .view(torch.bfloat16)
+        .view(layout.d_model, layout.n_groups_i, 1)
+    )
+    dn_scale = (
+        pg[layout.off_dn_scale : layout.off_dn_scale + layout.bytes_dn_scale]
+        .view(torch.bfloat16)
+        .view(layout.d_model, layout.n_groups_i, 1)
+    )
+    if lut_uint4 is not None:
+        dn_deq = (
+            F.embedding(dn_q4.to(torch.int32), lut_uint4.to(device=device)).view(
+                layout.d_model, layout.n_groups_i, layout.group_size
+            )
+            * dn_scale
+            + dn_wmin
+        ).view(layout.d_model, layout.i_pad)[:, :d_i]
+    else:
+        lo = (dn_q4 & 0x0F).to(torch.bfloat16)
+        hi = ((dn_q4 >> 4) & 0x0F).to(torch.bfloat16)
+        dn_vals = torch.stack([lo, hi], dim=-1).view(layout.d_model, layout.n_groups_i, layout.group_size)
+        dn_deq = (dn_vals * dn_scale + dn_wmin).view(layout.d_model, layout.i_pad)[:, :d_i]
+
+    dn_col_norms = dn_deq.float().norm(dim=0).to(torch.bfloat16).contiguous()  # [d_ffn]
+    dn_t_f32 = dn_deq.T.float().contiguous()  # [d_ffn, d_model]
+    dn_pk_u8, dn_mn_bf, dn_sc_bf = _quantize_uint4_2d_with_salience(dn_t_f32, group_size=64)
+    dn_ms_u8 = torch.stack([dn_mn_bf.view(torch.uint16), dn_sc_bf.view(torch.uint16)], dim=-1).view(torch.uint8).reshape(d_i, n_gd * 4)
+
+    dn_rows = torch.zeros((d_i, wina_layout.row_bytes), dtype=torch.uint8, device=device)
+    dn_rows[:, :n_q4_b].copy_(dn_pk_u8.reshape(d_i, n_q4_b))
+    dn_rows[:, n_q4_b : n_q4_b + n_gd * 4].copy_(dn_ms_u8)
+
+    out_pg = torch.zeros((wina_layout.page_bytes,), dtype=torch.uint8, device=device)
+    out_pg[wina_layout.off_gate : wina_layout.off_gate + d_i * wina_layout.row_bytes].copy_(gate_rows.reshape(-1))
+    out_pg[wina_layout.off_wina_norm : wina_layout.off_wina_norm + d_i * 2].copy_(dn_col_norms.view(torch.uint8).reshape(-1))
+    slabs = torch.cat([up_rows, dn_rows], dim=1)  # [d_ffn, 2 * row_bytes]
+    out_pg[wina_layout.off_slabs : wina_layout.off_slabs + d_i * wina_layout.slab_bytes].copy_(slabs.reshape(-1))
+    return out_pg.cpu()
+
+
+def get_default_l2_wina_ratio() -> float:
+    raw = os.environ.get("TMMU_L2_WINA_RATIO", "0.50").strip()
+    try:
+        val = float(raw)
+        return max(0.20, min(1.0, val))
+    except ValueError:
+        return 0.50
+
+
 class GPUExpertTLBCache(nn.Module):
     """3-Tier GPU Expert Cache: L1 VRAM LRU + L2 Zero-Copy Pinned DDR5 + Pinned-Ring L3 `nvme_mmap` DMA."""
 
@@ -281,9 +375,17 @@ class GPUExpertTLBCache(nn.Module):
         )
 
         # L2 Zero-Copy Pinned Host DDR5 Tier (`slot <= -2` -> `l2_idx = -2 - slot`)
+        # Supports both standard `UINT4` (`l2_pinned_pages`) and neuron-major `UINT4-WINA` (`l2_wina_pinned_pages`)!
         self.l2_slots: int = 0
         self.l2_pinned_pages: Optional[torch.Tensor] = None
         self.l2_zero_copy_dev_ptr: int = 0
+        self.l2_wina_pinned_pages: Optional[torch.Tensor] = None
+        self.l2_wina_dev_ptr: int = 0
+        self.wina_layout: Optional[WINAExpertPageLayout] = (
+            WINAExpertPageLayout.compute(layout.d_model, layout.d_ffn) if (layout.d_model % 64 == 0) else None
+        )
+        self.wina_keep_ratio: float = get_default_l2_wina_ratio()
+        self._l2_lut_uint4: Optional[torch.Tensor] = None
         self._l2_aliases_host_pages: bool = False
         self._expert_l2_home: List[int] = [-1] * self.num_experts
         self._l2_slot_to_expert: List[int] = []
@@ -320,25 +422,34 @@ class GPUExpertTLBCache(nn.Module):
         )
 
     @property
+    def has_l2_mapped(self) -> bool:
+        return self.l2_zero_copy_dev_ptr != 0 or self.l2_wina_dev_ptr != 0
+
+    @property
     def total_l2_pinned_ram_bytes(self) -> int:
-        if self._l2_aliases_host_pages or self.l2_pinned_pages is None:
+        if self._l2_aliases_host_pages:
             return 0
-        return int(self.l2_pinned_pages.numel() * self.l2_pinned_pages.element_size())
+        total = 0
+        if self.l2_pinned_pages is not None:
+            total += int(self.l2_pinned_pages.numel() * self.l2_pinned_pages.element_size())
+        if self.l2_wina_pinned_pages is not None:
+            total += int(self.l2_wina_pinned_pages.numel() * self.l2_wina_pinned_pages.element_size())
+        return total
 
     def _fallback_encoded_slot(self, exp_id: int) -> int:
         l2_h = self._expert_l2_home[exp_id]
-        if l2_h >= 0 and self.l2_zero_copy_dev_ptr != 0:
+        if l2_h >= 0 and self.has_l2_mapped:
             return -2 - l2_h
         return -1
 
     def _recompute_all_mapped_flag(self) -> None:
-        if self.tlb_slots <= 0 and self.l2_zero_copy_dev_ptr == 0:
+        if self.tlb_slots <= 0 and not self.has_l2_mapped:
             self.all_experts_mapped = False
             return
         if self.tlb_slots >= self.num_experts and self._num_valid == self.num_experts:
             self.all_experts_mapped = True
             return
-        if self.l2_zero_copy_dev_ptr != 0:
+        if self.has_l2_mapped:
             for e in range(self.num_experts):
                 if self._expert_to_slot[e] < 0 and self._expert_l2_home[e] < 0:
                     self.all_experts_mapped = False
@@ -350,8 +461,10 @@ class GPUExpertTLBCache(nn.Module):
     def release_l2_cache(self) -> None:
         if not self._l2_aliases_host_pages:
             self.l2_pinned_pages = None
+            self.l2_wina_pinned_pages = None
             self.l2_slots = 0
             self.l2_zero_copy_dev_ptr = 0
+            self.l2_wina_dev_ptr = 0
             self._expert_l2_home = [-1] * self.num_experts
             self._l2_slot_to_expert = []
             self._l2_hit_counts = [0] * self.num_experts
@@ -365,8 +478,10 @@ class GPUExpertTLBCache(nn.Module):
 
     def _reseed_l2_disjoint_from_l1(self) -> None:
         """Restores disjoint L2 population (`freq_rank_list` not in L1) after a full L1 re-seed."""
-        if self._l2_aliases_host_pages or self.l2_pinned_pages is None or self.l2_slots <= 0:
+        active_buf = self.l2_wina_pinned_pages if self.l2_wina_pinned_pages is not None else self.l2_pinned_pages
+        if self._l2_aliases_host_pages or active_buf is None or self.l2_slots <= 0:
             return
+        use_wina = self.l2_wina_pinned_pages is not None and self.wina_layout is not None
         in_l1 = {e for e in range(self.num_experts) if self._expert_to_slot[e] >= 0}
         self._expert_l2_home = [-1] * self.num_experts
         self._l2_hit_counts = [0] * self.num_experts
@@ -374,34 +489,64 @@ class GPUExpertTLBCache(nn.Module):
         for exp_id in self.freq_rank_list:
             if exp_id not in in_l1:
                 chosen.append(int(exp_id))
-                if len(chosen) >= int(self.l2_pinned_pages.shape[0]):
+                if len(chosen) >= int(active_buf.shape[0]):
                     break
         for idx_l2, exp_id in enumerate(chosen):
             if idx_l2 >= len(self._l2_slot_to_expert) or self._l2_slot_to_expert[idx_l2] != exp_id:
-                self.l2_pinned_pages[idx_l2].copy_(self.host_expert_pages[exp_id])
+                if use_wina:
+                    assert self.wina_layout is not None
+                    active_buf[idx_l2].copy_(
+                        repack_uint4_page_to_wina_q4(
+                            self.host_expert_pages[exp_id],
+                            self.layout,
+                            self.wina_layout,
+                            self.device,
+                            lut_uint4=self._l2_lut_uint4,
+                        )
+                    )
+                else:
+                    active_buf[idx_l2].copy_(self.host_expert_pages[exp_id])
             self._expert_l2_home[exp_id] = idx_l2
         self._l2_slot_to_expert = list(chosen)
         self.l2_slots = len(chosen)
 
-    def configure_l2_zero_copy(self, l2_slots: int) -> int:
-        """Allocates `l2_slots` of device-mapped pinned host DDR5 seeded with calibration-ranked warm experts."""
+    def configure_l2_zero_copy(
+        self,
+        l2_slots: int,
+        wina_keep_ratio: Optional[float] = None,
+        lut_uint4: Optional[torch.Tensor] = None,
+    ) -> int:
+        """Allocates `l2_slots` of device-mapped pinned host DDR5 (`UINT4-WINA` when `keep_ratio < 1.0`)."""
         if self._l2_aliases_host_pages or self.device.type != "cuda" or not torch.cuda.is_available():
             return self.l2_slots
+        eff_ratio = self.wina_keep_ratio if wina_keep_ratio is None else max(0.20, min(1.0, float(wina_keep_ratio)))
+        if lut_uint4 is not None:
+            self._l2_lut_uint4 = lut_uint4
+        use_wina = (0.0 < eff_ratio < 1.0) and (self.wina_layout is not None)
+
         max_useful = max(0, self.num_experts - self.tlb_slots)
         target = int(max(0, min(l2_slots, max_useful)))
-        if target == self.l2_slots and (target == 0 or self.l2_zero_copy_dev_ptr != 0):
+        if (
+            target == self.l2_slots
+            and eff_ratio == self.wina_keep_ratio
+            and (target == 0 or (self.l2_wina_dev_ptr != 0 if use_wina else self.l2_zero_copy_dev_ptr != 0))
+        ):
             return self.l2_slots
 
+        self.wina_keep_ratio = eff_ratio
         self.l2_pinned_pages = None
+        self.l2_wina_pinned_pages = None
         self.l2_slots = 0
         self.l2_zero_copy_dev_ptr = 0
+        self.l2_wina_dev_ptr = 0
         self._expert_l2_home = [-1] * self.num_experts
         self._l2_slot_to_expert = []
         self._l2_hit_counts = [0] * self.num_experts
 
         if target > 0:
+            pg_bytes = self.wina_layout.page_bytes if (use_wina and self.wina_layout is not None) else self.bytes_per_page
             try:
-                buf = torch.empty((target, self.bytes_per_page), dtype=torch.uint8, device="cpu").pin_memory()
+                buf = torch.empty((target, pg_bytes), dtype=torch.uint8, device="cpu").pin_memory()
                 zc_ptr = get_zero_copy_device_ptr(buf, self.device)
             except Exception:
                 buf = None
@@ -417,12 +562,27 @@ class GPUExpertTLBCache(nn.Module):
                         if len(chosen) >= target:
                             break
                 for idx_l2, exp_id in enumerate(chosen):
-                    buf[idx_l2].copy_(self.host_expert_pages[exp_id])
+                    if use_wina and self.wina_layout is not None:
+                        buf[idx_l2].copy_(
+                            repack_uint4_page_to_wina_q4(
+                                self.host_expert_pages[exp_id],
+                                self.layout,
+                                self.wina_layout,
+                                self.device,
+                                lut_uint4=self._l2_lut_uint4,
+                            )
+                        )
+                    else:
+                        buf[idx_l2].copy_(self.host_expert_pages[exp_id])
                     self._expert_l2_home[exp_id] = idx_l2
-                self.l2_pinned_pages = buf
+                if use_wina:
+                    self.l2_wina_pinned_pages = buf
+                    self.l2_wina_dev_ptr = zc_ptr
+                else:
+                    self.l2_pinned_pages = buf
+                    self.l2_zero_copy_dev_ptr = zc_ptr
                 self._l2_slot_to_expert = list(chosen)
                 self.l2_slots = len(chosen)
-                self.l2_zero_copy_dev_ptr = zc_ptr
 
         # Refresh encoded fallback slots for all non-L1 experts on GPU
         for e in range(self.num_experts):
@@ -723,7 +883,7 @@ class GPUExpertTLBCache(nn.Module):
         """Services exact `token_rows` (`[T, K]`) across L1 VRAM, L2 Zero-Copy DDR5, and L3 `nvme_mmap`."""
         self._step_spec_touched.clear()
 
-        if self.tlb_slots <= 0 and self.l2_zero_copy_dev_ptr == 0:
+        if self.tlb_slots <= 0 and not self.has_l2_mapped:
             return None
 
         n_exp = self.num_experts
@@ -753,7 +913,7 @@ class GPUExpertTLBCache(nn.Module):
 
         e2s = self._expert_to_slot
         l2_home = self._expert_l2_home
-        has_l2 = self.l2_zero_copy_dev_ptr != 0
+        has_l2 = self.has_l2_mapped
 
         must_be_in_l1: Set[int] = {
             e for e in uniq if not (has_l2 and l2_home[e] >= 0)
@@ -966,7 +1126,7 @@ class GPUExpertTLBCache(nn.Module):
         """Single-sync pinned D2H extraction of `(cur_flat, next_list)` BEFORE launching GPU Shared MLP compute."""
         if self.all_experts_mapped:
             return None, None
-        if self.tlb_slots <= 0 and self.l2_zero_copy_dev_ptr == 0:
+        if self.tlb_slots <= 0 and not self.has_l2_mapped:
             return None, None
 
         f_cur = top_k_index.reshape(-1)
@@ -1039,7 +1199,7 @@ class GPUExpertTLBCache(nn.Module):
             self._page_hits += int(top_k_index.shape[0])
             self._all_hit_fastpaths += 1
             return None
-        if self.tlb_slots <= 0 and self.l2_zero_copy_dev_ptr == 0:
+        if self.tlb_slots <= 0 and not self.has_l2_mapped:
             return None
 
         ptr = int(top_k_index.data_ptr())
@@ -1626,7 +1786,7 @@ class SparseMoETLBExperts(nn.Module):
             and self.use_fused_kernels
             and self._cuda_launcher is not None
             and flat_x.is_cuda
-            and (self.tlb_cache.tlb_slots > 0 or self.tlb_cache.l2_zero_copy_dev_ptr != 0)
+            and (self.tlb_cache.tlb_slots > 0 or self.tlb_cache.has_l2_mapped)
         ):
             overflow_uniq = self.tlb_cache.wait_or_service_topk(top_k_index)
             if overflow_uniq is None:
@@ -1650,6 +1810,8 @@ class SparseMoETLBExperts(nn.Module):
                     expert_to_slot=self.tlb_cache.gpu_expert_to_slot,
                     out_bf16=out_bf,
                     l2_zero_copy_dev_ptr=self.tlb_cache.l2_zero_copy_dev_ptr,
+                    l2_wina_dev_ptr=self.tlb_cache.l2_wina_dev_ptr,
+                    wina_keep_ratio=self.tlb_cache.wina_keep_ratio,
                 )
                 self.tlb_cache.record_compute_read(torch.cuda.current_stream(x_bf.device))
                 self._dispatch_queued_lookahead()
@@ -1670,6 +1832,7 @@ def auto_configure_moe_l2_zero_copy(
     moe_experts_by_layer: Dict[int, SparseMoETLBExperts],
     reserve_free_ram_gb: float = 9.5,
     max_l2_ram_gb: Optional[float] = None,
+    wina_keep_ratio: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Automatically sizes device-mapped pinned DDR5 L2 expert caches within safe physical RAM limits.
 
@@ -1685,7 +1848,7 @@ def auto_configure_moe_l2_zero_copy(
     layers = list(moe_experts_by_layer.values())
     first = layers[0]
     if first.mode != "vm_paged" or first.device.type != "cuda" or not torch.cuda.is_available():
-        had_l2 = any(m.tlb_cache.l2_pinned_pages is not None for m in layers)
+        had_l2 = any(m.tlb_cache.has_l2_mapped or m.tlb_cache.l2_pinned_pages is not None or m.tlb_cache.l2_wina_pinned_pages is not None for m in layers)
         for m in layers:
             m.tlb_cache.release_l2_cache()
         if had_l2 and hasattr(torch._C, "_host_emptyCache"):
@@ -1760,9 +1923,14 @@ def auto_configure_moe_l2_zero_copy(
     if bytes_per_slot_across_model <= 0 or eff_budget < bytes_per_slot_across_model:
         return {"l2_slots_per_layer": 0, "total_l2_gb": 0.0, "all_mapped": False}
 
+    eff_wina = get_default_l2_wina_ratio() if wina_keep_ratio is None else max(0.20, min(1.0, float(wina_keep_ratio)))
     l2_slots = eff_budget // bytes_per_slot_across_model
     for m in layers:
-        m.tlb_cache.configure_l2_zero_copy(int(l2_slots))
+        m.tlb_cache.configure_l2_zero_copy(
+            int(l2_slots),
+            wina_keep_ratio=eff_wina,
+            lut_uint4=m.lut_pool.lut_uint4 if m.lut_pool is not None else None,
+        )
 
     tot_l2_bytes = sum(m.tlb_cache.total_l2_pinned_ram_bytes for m in layers)
     all_mapped = all(m.tlb_cache.all_experts_mapped for m in layers)
@@ -1770,6 +1938,7 @@ def auto_configure_moe_l2_zero_copy(
         "l2_slots_per_layer": int(layers[0].tlb_cache.l2_slots),
         "total_l2_gb": float(tot_l2_bytes) / float(1024 ** 3),
         "all_mapped": bool(all_mapped),
+        "l2_wina_ratio": float(layers[0].tlb_cache.wina_keep_ratio) if layers[0].tlb_cache.l2_wina_dev_ptr != 0 else 1.0,
     }
 
 

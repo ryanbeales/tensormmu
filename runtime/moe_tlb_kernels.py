@@ -131,6 +131,46 @@ class ContiguousExpertPageLayout:
         return {k: int(getattr(self, k)) for k in self.__dataclass_fields__}
 
 
+@dataclass(frozen=True)
+class WINAExpertPageLayout:
+    """4KB-aligned neuron-major `UINT4-WINA` L2 Zero-Copy expert page layout (`gate` + `wina_norms` + `(up_j, down_j)`)."""
+
+    d_model: int
+    d_ffn: int
+    n_groups_d: int
+    row_bytes: int
+    slab_bytes: int
+    off_gate: int
+    off_wina_norm: int
+    off_slabs: int
+    page_bytes: int
+
+    @classmethod
+    def compute(cls, d_model: int, d_ffn: int) -> "WINAExpertPageLayout":
+        d_m = int(d_model)
+        d_i = int(d_ffn)
+        assert d_m % 64 == 0, f"WINAExpertPageLayout requires d_model % 64 == 0, got {d_m}"
+        n_groups = d_m // 64
+        # Per-row layout: [n_groups * 32 B of UINT4] + [n_groups * 4 B of packed (wmin_bf16, scale_bf16)]
+        row_b = _align_up(n_groups * 36, SUBTENSOR_ALIGN_BYTES)
+        slab_b = 2 * row_b  # [up_row[j], down_col[j]] contiguous per intermediate neuron j
+        off_gate = 0
+        off_wina = _align_up(d_i * row_b, SUBTENSOR_ALIGN_BYTES)
+        off_slabs = _align_up(off_wina + d_i * 2, SUBTENSOR_ALIGN_BYTES)
+        page_b = _align_up(off_slabs + d_i * slab_b, OS_PAGE_ALIGN_BYTES)
+        return cls(
+            d_model=d_m,
+            d_ffn=d_i,
+            n_groups_d=n_groups,
+            row_bytes=row_b,
+            slab_bytes=slab_b,
+            off_gate=off_gate,
+            off_wina_norm=off_wina,
+            off_slabs=off_slabs,
+            page_bytes=page_b,
+        )
+
+
 MOE_TLB_CUDA_SOURCE = r"""
 typedef unsigned short bf16_t;
 typedef unsigned char uint8_t;
@@ -612,6 +652,314 @@ extern "C" __global__ void moe_f32_to_bf16_kernel(
         out_bf16[idx] = f32_to_bf16(acc);
     }
 }
+
+// =============================================================================
+// UINT4-WINA L2 Zero-Copy Kernels (Gate-First Conditional Neuron-Major Fetch)
+// Splits active routes into:
+//   - L1 VRAM hits (`slot >= 0`)   -> exact UINT4 `moe_uint4_gate_up_act_kernel` + `moe_uint4_down_accum_kernel`
+//   - L2 DDR5 hits (`slot <= -2`)  -> `moe_wina_gate_q4_kernel` -> `moe_wina_select_top_kernel` -> `moe_wina_up_down_q4_kernel`
+// Both accumulate into `partial_f32[pair_id, d]` so `moe_f32_to_bf16_kernel` sums L1 + L2 seamlessly!
+// 100% Full CUDA Graph safe (`if (a >= *num_l2_ptr) return;` with zero CPU sync!).
+// =============================================================================
+extern "C" __global__ void moe_pack_routes_wina_kernel(
+    const long long* __restrict__ top_k_index,  // [T * K]
+    const float* __restrict__ top_k_weights,    // [T * K]
+    const int* __restrict__ expert_to_slot,     // [num_experts]: >=0 L1 VRAM, <=-2 L2 WINA, -1 unmapped
+    int* __restrict__ active_slots,             // [MAX_ACTIVE] (L1 only)
+    int* __restrict__ active_counts,            // [MAX_ACTIVE]
+    int* __restrict__ active_tok_ids,           // [MAX_ACTIVE * MAX_M]
+    int* __restrict__ active_pair_ids,          // [MAX_ACTIVE * MAX_M]
+    float* __restrict__ active_weights,         // [MAX_ACTIVE * MAX_M]
+    int* __restrict__ num_unique_out,           // [1] (L1 unique count)
+    int* __restrict__ wina_l2_slots,            // [MAX_ACTIVE] (l2_idx = -2 - slot)
+    int* __restrict__ wina_l2_tok_ids,          // [MAX_ACTIVE]
+    int* __restrict__ wina_l2_pair_ids,         // [MAX_ACTIVE]
+    float* __restrict__ wina_l2_weights,        // [MAX_ACTIVE]
+    int* __restrict__ wina_num_l2_out,          // [1] (L2 pair count)
+    float* __restrict__ partial_f32,            // [T * K * d_model]
+    int T,
+    int K,
+    int num_experts,
+    int d_model
+) {
+    __shared__ short s_u_idx[MAX_EXPERTS];
+    __shared__ short s_cnt[MAX_EXPERTS];
+
+    const int tid = threadIdx.x;
+    const int total_partial = T * K * d_model;
+    for (int i = tid; i < total_partial; i += blockDim.x) {
+        partial_f32[i] = 0.0f;
+    }
+
+    const int n_exp = (num_experts <= MAX_EXPERTS) ? num_experts : MAX_EXPERTS;
+    for (int e = tid; e < n_exp; e += blockDim.x) {
+        s_u_idx[e] = -1;
+        s_cnt[e] = 0;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        int num_u = 0;
+        int num_l2 = 0;
+        const int total_pairs = T * K;
+        for (int idx = 0; idx < total_pairs; ++idx) {
+            const int t = idx / K;
+            const int e = (int)top_k_index[idx];
+            if (e < 0 || e >= n_exp) continue;
+            const int slot = expert_to_slot[e];
+            if (slot == -1) continue;
+            const float w = top_k_weights[idx];
+
+            if (slot <= -2) {
+                if (num_l2 < 128) {
+                    wina_l2_slots[num_l2] = -2 - slot;
+                    wina_l2_tok_ids[num_l2] = t;
+                    wina_l2_pair_ids[num_l2] = idx;
+                    wina_l2_weights[num_l2] = w;
+                    num_l2++;
+                }
+                continue;
+            }
+
+            int u = (int)s_u_idx[e];
+            if (u < 0) {
+                u = num_u++;
+                s_u_idx[e] = (short)u;
+                active_slots[u] = slot;
+            }
+            int pos = (int)s_cnt[e];
+            if (pos > 0 && active_tok_ids[u * MAX_M + pos - 1] == t) {
+                active_weights[u * MAX_M + pos - 1] += w;
+            } else if (pos < MAX_M) {
+                active_tok_ids[u * MAX_M + pos] = t;
+                active_pair_ids[u * MAX_M + pos] = idx;
+                active_weights[u * MAX_M + pos] = w;
+                s_cnt[e] = (short)(pos + 1);
+                active_counts[u] = pos + 1;
+            }
+        }
+        *num_unique_out = num_u;
+        *wina_num_l2_out = num_l2;
+    }
+}
+
+__device__ __forceinline__ float wina_dot_q4_grp64_bf16(
+    const uint4* __restrict__ q4_u4,
+    unsigned int mn_sc_packed,
+    const bf16_t* __restrict__ xp
+) {
+    const float mn = bf16_to_f32((bf16_t)(mn_sc_packed & 0xFFFFU));
+    const float sc = bf16_to_f32((bf16_t)(mn_sc_packed >> 16));
+    uint4 v0 = __ldg(&q4_u4[0]);
+    uint4 v1 = __ldg(&q4_u4[1]);
+    unsigned int words[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+    float qdot = 0.0f;
+    float xsum = 0.0f;
+    #pragma unroll
+    for (int wi = 0; wi < 8; ++wi) {
+        unsigned int w = words[wi];
+        const bf16_t* xw = xp + (wi << 3);
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            float xv = bf16_to_f32(__ldg(&xw[k]));
+            xsum += xv;
+            qdot += (float)((w >> (k << 2)) & 0x0FU) * xv;
+        }
+    }
+    return qdot * sc + xsum * mn;
+}
+
+extern "C" __global__ void moe_wina_gate_q4_kernel(
+    const bf16_t* __restrict__ x_in,          // [T, d_model]
+    const uint8_t* __restrict__ l2_wina_pages,// [l2_slots, page_bytes]
+    const int* __restrict__ wina_l2_slots,    // [MAX_L2]
+    const int* __restrict__ wina_l2_tok_ids,  // [MAX_L2]
+    const int* __restrict__ wina_num_l2_ptr,  // [1]
+    float* __restrict__ gate_act_out,         // [MAX_L2, d_ffn]
+    float* __restrict__ wina_score_out,       // [MAX_L2, d_ffn]
+    int d_model,
+    int d_ffn,
+    int n_groups_d,
+    int row_bytes,
+    int page_bytes,
+    int off_gate,
+    int off_wina_norm,
+    int act_kind
+) {
+    const int a = blockIdx.y;
+    if (a >= *wina_num_l2_ptr) return;
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int row = blockIdx.x * 4 + warp;
+    if (row >= d_ffn) return;
+
+    const int l2_idx = wina_l2_slots[a];
+    const int t = wina_l2_tok_ids[a];
+    const bf16_t* xt = x_in + (size_t)t * (size_t)d_model;
+    const uint8_t* page = l2_wina_pages + (size_t)l2_idx * (size_t)page_bytes;
+    const uint8_t* row_ptr = page + off_gate + (size_t)row * (size_t)row_bytes;
+    const float dn_norm = bf16_to_f32(__ldg(&((const bf16_t*)(page + off_wina_norm))[row]));
+
+    const uint4* q4_base = (const uint4*)row_ptr;
+    const unsigned int* ms_base = (const unsigned int*)(row_ptr + n_groups_d * 32);
+    float acc = 0.0f;
+    for (int g = lane; g < n_groups_d; g += 32) {
+        acc += wina_dot_q4_grp64_bf16(q4_base + g * 2, __ldg(&ms_base[g]), xt + (g << 6));
+    }
+
+    float g_val = warp_sum(acc);
+    if (lane == 0) {
+        float ga = apply_moe_act(g_val, act_kind);
+        gate_act_out[(size_t)a * (size_t)d_ffn + row] = ga;
+        wina_score_out[(size_t)a * (size_t)d_ffn + row] = fabsf(ga) * dn_norm;
+    }
+}
+
+extern "C" __global__ void moe_wina_select_top_kernel(
+    const float* __restrict__ wina_scores,    // [MAX_L2, d_ffn]
+    const int* __restrict__ wina_num_l2_ptr,  // [1]
+    int* __restrict__ active_neurons,         // [MAX_L2, k_keep]
+    int d_ffn,
+    int k_keep
+) {
+    const int a = blockIdx.x;
+    if (a >= *wina_num_l2_ptr) return;
+
+    const int tid = threadIdx.x;
+    __shared__ float s_sc[2048];
+    __shared__ float s_lo, s_hi, s_thr;
+    __shared__ int s_cnt;
+
+    const float* sc_row = wina_scores + (size_t)a * (size_t)d_ffn;
+    float local_max = 0.0f;
+    for (int j = tid; j < d_ffn; j += blockDim.x) {
+        float v = sc_row[j];
+        if (j < 2048) s_sc[j] = v;
+        if (v > local_max) local_max = v;
+    }
+    if (tid == 0) { s_lo = 0.0f; s_hi = 0.0f; }
+    __syncthreads();
+    atomicMax((int*)&s_hi, __float_as_int(local_max));
+    __syncthreads();
+
+    for (int iter = 0; iter < 14; ++iter) {
+        if (tid == 0) { s_thr = 0.5f * (s_lo + s_hi); s_cnt = 0; }
+        __syncthreads();
+        float thr = s_thr;
+        int c = 0;
+        for (int j = tid; j < d_ffn; j += blockDim.x) {
+            float v = (j < 2048) ? s_sc[j] : sc_row[j];
+            if (v >= thr) c++;
+        }
+        if (c > 0) atomicAdd(&s_cnt, c);
+        __syncthreads();
+        if (tid == 0) {
+            if (s_cnt > k_keep) s_lo = thr;
+            else s_hi = thr;
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) s_cnt = 0;
+    __syncthreads();
+    float final_thr = s_hi;
+    int* out_row = active_neurons + (size_t)a * (size_t)k_keep;
+
+    for (int j = tid; j < d_ffn; j += blockDim.x) {
+        float v = (j < 2048) ? s_sc[j] : sc_row[j];
+        if (v >= final_thr) {
+            int pos = atomicAdd(&s_cnt, 1);
+            if (pos < k_keep) out_row[pos] = j;
+        }
+    }
+    __syncthreads();
+    for (int j = tid; j < d_ffn; j += blockDim.x) {
+        float v = (j < 2048) ? s_sc[j] : sc_row[j];
+        if (v < final_thr && v >= s_lo) {
+            int pos = atomicAdd(&s_cnt, 1);
+            if (pos < k_keep) out_row[pos] = j;
+        }
+    }
+    __syncthreads();
+    for (int j = tid; j < k_keep; j += blockDim.x) {
+        if (j >= s_cnt) out_row[j] = j;
+    }
+}
+
+extern "C" __global__ void moe_wina_up_down_q4_kernel(
+    const bf16_t* __restrict__ x_in,          // [T, d_model]
+    const uint8_t* __restrict__ l2_wina_pages,// [l2_slots, page_bytes]
+    const int* __restrict__ wina_l2_slots,    // [MAX_L2]
+    const int* __restrict__ wina_l2_tok_ids,  // [MAX_L2]
+    const int* __restrict__ wina_l2_pair_ids, // [MAX_L2]
+    const float* __restrict__ wina_l2_weights,// [MAX_L2]
+    const int* __restrict__ wina_num_l2_ptr,  // [1]
+    const float* __restrict__ gate_act,       // [MAX_L2, d_ffn]
+    const int* __restrict__ active_neurons,   // [MAX_L2, k_keep]
+    float* __restrict__ partial_f32,          // [T * K * d_model] (each pair has its own row!)
+    int d_model,
+    int d_ffn,
+    int k_keep,
+    int n_groups_d,
+    int row_bytes,
+    int slab_bytes,
+    int page_bytes,
+    int off_slabs
+) {
+    const int a = blockIdx.y;
+    if (a >= *wina_num_l2_ptr) return;
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int slot_k = blockIdx.x * 4 + warp;
+    if (slot_k >= k_keep) return;
+
+    const int j = (k_keep < d_ffn) ? active_neurons[(size_t)a * (size_t)k_keep + slot_k] : slot_k;
+    const int l2_idx = wina_l2_slots[a];
+    const int t = wina_l2_tok_ids[a];
+    const int pair_id = wina_l2_pair_ids[a];
+    const bf16_t* xt = x_in + (size_t)t * (size_t)d_model;
+    const uint8_t* page = l2_wina_pages + (size_t)l2_idx * (size_t)page_bytes;
+    const uint8_t* slab = page + off_slabs + (size_t)j * (size_t)slab_bytes;
+
+    const uint4* up_q4 = (const uint4*)slab;
+    const unsigned int* up_ms = (const unsigned int*)(slab + n_groups_d * 32);
+    float u_acc = 0.0f;
+    for (int g = lane; g < n_groups_d; g += 32) {
+        u_acc += wina_dot_q4_grp64_bf16(up_q4 + g * 2, __ldg(&up_ms[g]), xt + (g << 6));
+    }
+
+    float u_val = warp_sum(u_acc);
+    u_val = __shfl_sync(0xffffffffU, u_val, 0);
+    const float coeff = gate_act[(size_t)a * (size_t)d_ffn + j] * u_val * wina_l2_weights[a];
+
+    const uint8_t* dn_ptr = slab + row_bytes;
+    const uint4* dn_q4 = (const uint4*)dn_ptr;
+    const unsigned int* dn_ms = (const unsigned int*)(dn_ptr + n_groups_d * 32);
+    float* dst_row = partial_f32 + (size_t)pair_id * (size_t)d_model;
+
+    for (int g = lane; g < n_groups_d; g += 32) {
+        unsigned int mn_sc = __ldg(&dn_ms[g]);
+        const float mn_c = bf16_to_f32((bf16_t)(mn_sc & 0xFFFFU)) * coeff;
+        const float sc_c = bf16_to_f32((bf16_t)(mn_sc >> 16)) * coeff;
+        uint4 v0 = __ldg(&dn_q4[g * 2]);
+        uint4 v1 = __ldg(&dn_q4[g * 2 + 1]);
+        unsigned int words[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+        float* yp = dst_row + (g << 6);
+        #pragma unroll
+        for (int wi = 0; wi < 8; ++wi) {
+            unsigned int w = words[wi];
+            float* yw = yp + (wi << 3);
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                atomicAdd(&yw[k], (float)((w >> (k << 2)) & 0x0FU) * sc_c + mn_c);
+            }
+        }
+    }
+}
 """
 
 _MOE_KERNELS_BY_DEVICE: Dict[int, Dict[str, Any]] = {}
@@ -656,6 +1004,10 @@ def get_or_compile_moe_tlb_kernels(device: torch.device) -> Dict[str, Any]:
             "moe_uint4_gate_up_act_kernel",
             "moe_uint4_down_accum_kernel",
             "moe_f32_to_bf16_kernel",
+            "moe_pack_routes_wina_kernel",
+            "moe_wina_gate_q4_kernel",
+            "moe_wina_select_top_kernel",
+            "moe_wina_up_down_q4_kernel",
         ]
         kd = _cuda_load_module(cubin_buf.raw, names)
         kd["moe_uint4_gate_up_act_kernel"].set_shared_memory_config(65536)
@@ -785,6 +1137,16 @@ class SharedMoEWorkspace:
         self.prefill_page_stage = torch.empty((0,), dtype=torch.uint8, device=device)
         self.prefill_out_f32 = torch.empty((0,), dtype=torch.float32, device=device)
 
+        # Compact GPU scratch buffers for `UINT4-WINA` L2 Zero-Copy conditional neuron fetch (< 1.5 MiB)
+        self.wina_l2_slots = torch.zeros((MAX_ACTIVE_UNIQUE,), dtype=torch.int32, device=device)
+        self.wina_l2_tok_ids = torch.zeros((MAX_ACTIVE_UNIQUE,), dtype=torch.int32, device=device)
+        self.wina_l2_pair_ids = torch.zeros((MAX_ACTIVE_UNIQUE,), dtype=torch.int32, device=device)
+        self.wina_l2_weights = torch.zeros((MAX_ACTIVE_UNIQUE,), dtype=torch.float32, device=device)
+        self.wina_num_l2 = torch.zeros((1,), dtype=torch.int32, device=device)
+        self.wina_gate_act = torch.empty((0,), dtype=torch.float32, device=device)
+        self.wina_scores = torch.empty((0,), dtype=torch.float32, device=device)
+        self.wina_active_neurons = torch.empty((0,), dtype=torch.int32, device=device)
+
         # Shared 32-slot pinned host DMA staging ring (~56 MB on 80B) eliminating blocking pageable mmap copies!
         self.pinned_dma_stage = torch.empty((0, 0), dtype=torch.uint8, device="cpu")
         self._dma_ring_cursor: int = 0
@@ -804,6 +1166,9 @@ class SharedMoEWorkspace:
                 dtype=torch.float32,
                 device=self.device,
             )
+            self.wina_gate_act = torch.zeros((MAX_ACTIVE_UNIQUE * self.max_d_ffn,), dtype=torch.float32, device=self.device)
+            self.wina_scores = torch.zeros((MAX_ACTIVE_UNIQUE * self.max_d_ffn,), dtype=torch.float32, device=self.device)
+            self.wina_active_neurons = torch.zeros((MAX_ACTIVE_UNIQUE * self.max_d_ffn,), dtype=torch.int32, device=self.device)
             changed = True
         if d_model > self.max_d_model:
             self.max_d_model = int(d_model)
@@ -903,12 +1268,17 @@ class MoETLBLayerLauncher:
         self._exp_to_slot_ptr = ctypes.c_void_p(0)
         self._tlb_ptr = ctypes.c_void_p(0)
         self._l2_ptr = ctypes.c_void_p(0)
+        self._l2_wina_ptr = ctypes.c_void_p(0)
         self._partial_ptr = ctypes.c_void_p(0)
         self._out_bf16_ptr = ctypes.c_void_p(0)
         self._T = ctypes.c_int(1)
         self._K = ctypes.c_int(8)
         self._total_elems = ctypes.c_int(layout.d_model)
         self._zero_elems = ctypes.c_int(layout.d_model)
+        self._wina_k_keep = ctypes.c_int(max(1, layout.d_ffn // 2))
+        self.wina_layout: Optional[WINAExpertPageLayout] = (
+            WINAExpertPageLayout.compute(layout.d_model, layout.d_ffn) if (layout.d_model % 64 == 0) else None
+        )
 
         self._grid_gu_x = (layout.d_ffn + 3) // 4
         self._grid_dn_x = (layout.d_model + 3) // 4
@@ -916,9 +1286,13 @@ class MoETLBLayerLauncher:
         self._refs: List[Any] = []
         self._args_zero: Any = None
         self._args_pack: Any = None
+        self._args_pack_wina: Any = None
         self._args_gu: Any = None
         self._args_dn: Any = None
         self._args_ep: Any = None
+        self._args_wina_gate: Any = None
+        self._args_wina_sel: Any = None
+        self._args_wina_ud: Any = None
         self._kd: Optional[Dict[str, Any]] = None
 
     @staticmethod
@@ -1025,6 +1399,85 @@ class MoETLBLayerLauncher:
             ],
             refs,
         )
+        if self.wina_layout is not None:
+            wl = self.wina_layout
+            self._args_pack_wina = self._build_c_args(
+                [
+                    self._topk_idx_ptr,
+                    self._topk_w_ptr,
+                    self._exp_to_slot_ptr,
+                    self._ws.active_slots,
+                    self._ws.active_counts,
+                    self._ws.active_tok_ids,
+                    self._ws.active_pair_ids,
+                    self._ws.active_weights,
+                    self._ws.num_unique,
+                    self._ws.wina_l2_slots,
+                    self._ws.wina_l2_tok_ids,
+                    self._ws.wina_l2_pair_ids,
+                    self._ws.wina_l2_weights,
+                    self._ws.wina_num_l2,
+                    self._partial_ptr,
+                    self._T,
+                    self._K,
+                    self.num_experts,
+                    lay.d_model,
+                ],
+                refs,
+            )
+            self._args_wina_gate = self._build_c_args(
+                [
+                    self._x_ptr,
+                    self._l2_wina_ptr,
+                    self._ws.wina_l2_slots,
+                    self._ws.wina_l2_tok_ids,
+                    self._ws.wina_num_l2,
+                    self._ws.wina_gate_act,
+                    self._ws.wina_scores,
+                    wl.d_model,
+                    wl.d_ffn,
+                    wl.n_groups_d,
+                    wl.row_bytes,
+                    wl.page_bytes,
+                    wl.off_gate,
+                    wl.off_wina_norm,
+                    self.act_kind,
+                ],
+                refs,
+            )
+            self._args_wina_sel = self._build_c_args(
+                [
+                    self._ws.wina_scores,
+                    self._ws.wina_num_l2,
+                    self._ws.wina_active_neurons,
+                    wl.d_ffn,
+                    self._wina_k_keep,
+                ],
+                refs,
+            )
+            self._args_wina_ud = self._build_c_args(
+                [
+                    self._x_ptr,
+                    self._l2_wina_ptr,
+                    self._ws.wina_l2_slots,
+                    self._ws.wina_l2_tok_ids,
+                    self._ws.wina_l2_pair_ids,
+                    self._ws.wina_l2_weights,
+                    self._ws.wina_num_l2,
+                    self._ws.wina_gate_act,
+                    self._ws.wina_active_neurons,
+                    self._partial_ptr,
+                    wl.d_model,
+                    wl.d_ffn,
+                    self._wina_k_keep,
+                    wl.n_groups_d,
+                    wl.row_bytes,
+                    wl.slab_bytes,
+                    wl.page_bytes,
+                    wl.off_slabs,
+                ],
+                refs,
+            )
         self._refs = refs
         self._bound_ws_version = self._ws.version
         self._bound_tlb_ptr = tlb_pages.data_ptr()
@@ -1038,6 +1491,8 @@ class MoETLBLayerLauncher:
         expert_to_slot: torch.Tensor,
         out_bf16: torch.Tensor,
         l2_zero_copy_dev_ptr: int = 0,
+        l2_wina_dev_ptr: int = 0,
+        wina_keep_ratio: float = 1.0,
     ) -> None:
         T = int(x_bf16.shape[0])
         K = int(top_k_idx_i64.shape[1])
@@ -1058,6 +1513,7 @@ class MoETLBLayerLauncher:
         self._exp_to_slot_ptr.value = expert_to_slot.data_ptr()
         self._tlb_ptr.value = tlb_pages.data_ptr()
         self._l2_ptr.value = int(l2_zero_copy_dev_ptr)
+        self._l2_wina_ptr.value = int(l2_wina_dev_ptr)
         self._partial_ptr.value = self._ws.out_f32.data_ptr()
         self._out_bf16_ptr.value = out_bf16.data_ptr()
         self._T.value = T
@@ -1067,6 +1523,54 @@ class MoETLBLayerLauncher:
 
         max_u = min(self.num_experts, T * K, MAX_ACTIVE_UNIQUE)
         smem_bytes = min(T, MAX_FUSED_DECODE_TOKENS) * 1024 * 4
+        use_wina = (
+            l2_wina_dev_ptr != 0
+            and self.wina_layout is not None
+            and self._args_pack_wina is not None
+            and (0.0 < float(wina_keep_ratio) < 1.0 or l2_zero_copy_dev_ptr == 0)
+        )
+
+        if use_wina:
+            k_keep = max(1, min(self.layout.d_ffn, int(round(self.layout.d_ffn * float(wina_keep_ratio)))))
+            self._wina_k_keep.value = k_keep
+            max_l2_pairs = min(T * K, MAX_ACTIVE_UNIQUE)
+
+            r0 = libcuda.cuLaunchKernel(
+                self._kd["moe_pack_routes_wina_kernel"].func,
+                1, 1, 1, 256, 1, 1, 0, stream_h, self._args_pack_wina, None,
+            )
+            # L1 VRAM hits (`slot >= 0`) run exact UINT4 kernels
+            r1 = libcuda.cuLaunchKernel(
+                self._kd["moe_uint4_gate_up_act_kernel"].func,
+                self._grid_gu_x, max_u, 1, 128, 1, 1, smem_bytes, stream_h, self._args_gu, None,
+            )
+            r2 = libcuda.cuLaunchKernel(
+                self._kd["moe_uint4_down_accum_kernel"].func,
+                self._grid_dn_x, max_u, 1, 128, 1, 1, smem_bytes, stream_h, self._args_dn, None,
+            )
+            # L2 Zero-Copy hits (`slot <= -2`) run Gate-First `UINT4-WINA` conditional fetch
+            rw0 = libcuda.cuLaunchKernel(
+                self._kd["moe_wina_gate_q4_kernel"].func,
+                self._grid_gu_x, max_l2_pairs, 1, 128, 1, 1, 0, stream_h, self._args_wina_gate, None,
+            )
+            rw1 = 0
+            if k_keep < self.layout.d_ffn:
+                rw1 = libcuda.cuLaunchKernel(
+                    self._kd["moe_wina_select_top_kernel"].func,
+                    max_l2_pairs, 1, 1, 256, 1, 1, 0, stream_h, self._args_wina_sel, None,
+                )
+            rw2 = libcuda.cuLaunchKernel(
+                self._kd["moe_wina_up_down_q4_kernel"].func,
+                (k_keep + 3) // 4, max_l2_pairs, 1, 128, 1, 1, 0, stream_h, self._args_wina_ud, None,
+            )
+            grid_ep = (tot_el + 255) // 256
+            r3 = libcuda.cuLaunchKernel(
+                self._kd["moe_f32_to_bf16_kernel"].func,
+                grid_ep, 1, 1, 256, 1, 1, 0, stream_h, self._args_ep, None,
+            )
+            if (r0 | r1 | r2 | rw0 | rw1 | rw2 | r3) != 0:
+                raise RuntimeError(f"MoE WINA kernel launch failed: r=({r0},{r1},{r2},{rw0},{rw1},{rw2},{r3})")
+            return
 
         r0 = libcuda.cuLaunchKernel(
             self._kd["moe_pack_routes_kernel"].func,

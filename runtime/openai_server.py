@@ -504,6 +504,10 @@ class TensorMMUEngine:
         first_layer = next(iter(self.paged_layers.values()), None)
         max_pages = int(getattr(first_layer, "num_experts", None) or getattr(first_layer, "num_pages", 0))
         l2_slots = int(getattr(first_layer.tlb_cache, "l2_slots", 0)) if first_layer is not None else 0
+        l2_wina_active = bool(first_layer is not None and getattr(first_layer.tlb_cache, "l2_wina_dev_ptr", 0) != 0)
+        l2_wina_ratio = (
+            float(getattr(first_layer.tlb_cache, "wina_keep_ratio", 1.0)) if l2_wina_active else 1.0
+        )
         l2_ram_gb = round(
             sum(getattr(m.tlb_cache, "total_l2_pinned_ram_bytes", 0) for m in self.paged_layers.values()) / (1024 ** 3),
             3,
@@ -533,6 +537,8 @@ class TensorMMUEngine:
             "vm_mode": self.vm_mode,
             "tlb_slots": self.tlb_slots,
             "l2_slots": l2_slots,
+            "l2_wina_active": l2_wina_active,
+            "l2_wina_ratio": l2_wina_ratio,
             "l2_ram_gb": l2_ram_gb,
             "all_experts_mapped": all_mapped,
             "cuda_graph_mode": graph_mode,
