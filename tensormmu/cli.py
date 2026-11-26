@@ -300,7 +300,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--draft-mode",
         type=str,
         default=os.environ.get("TMMU_DRAFT_MODE", "two_tier"),
-        choices=["two_tier", "pld_only", "eagle_only", "none"],
+        choices=["two_tier", "mtp_only", "pld_only", "eagle_only", "none"],
     )
     p_srv.add_argument("--no-confidence-gated-moe", action="store_true")
     p_srv.add_argument("--auto-swap-model", action="store_true", default=_env_bool("TMMU_AUTO_SWAP_MODEL"))

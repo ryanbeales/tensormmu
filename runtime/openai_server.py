@@ -38,6 +38,7 @@ from aiohttp import web
 from decompiler.nvm_serializer import load_nvm_cartridge
 from runtime.moe_expert_tlb import SparseMoETLBExperts, auto_configure_moe_l2_zero_copy
 from runtime.moe_lookahead_router import LookaheadRouterBank
+from runtime.native_mtp import NativeMTPModule
 from runtime.speculative_vm import (
     EagleLiteDraftHead,
     PromptLookupDrafter,
@@ -256,6 +257,7 @@ class TensorMMUEngine:
         self.ple_offloader: Any = None
         self.manifest: Dict[str, Any] = {}
         self.draft_head: Optional[EagleLiteDraftHead] = None
+        self.native_mtp: Optional[NativeMTPModule] = None
         self.lookahead_bank: Optional[LookaheadRouterBank] = None
         self.pld_drafter = PromptLookupDrafter()
         self.fit_assessment: Optional[FitAssessment] = None
@@ -318,6 +320,9 @@ class TensorMMUEngine:
                     m.release_tlb()
             self.paged_layers.clear()
             self.draft_head = None
+            if self.native_mtp is not None:
+                self.native_mtp.release()
+                self.native_mtp = None
             self.lookahead_bank = None
             self.ple_offloader = None
             self.lut_pool = None
@@ -397,6 +402,16 @@ class TensorMMUEngine:
                     lut_pool=lut_pool,
                 )
 
+            native_mtp: Optional[NativeMTPModule] = None
+            if NativeMTPModule.has_saved_mtp(cart_dir):
+                native_mtp = NativeMTPModule.load_from_cartridge(
+                    cartridge_dir=cart_dir,
+                    main_model=model,
+                    lut_pool=lut_pool,
+                    device=self.device,
+                    dtype=torch.bfloat16,
+                )
+
             lookahead_bank: Optional[LookaheadRouterBank] = None
             if is_moe and LookaheadRouterBank.has_saved_nvm(cart_dir):
                 lookahead_bank = LookaheadRouterBank.load_pretrained_nvm(
@@ -410,7 +425,9 @@ class TensorMMUEngine:
                     runner_init.invalidate_graphs()
 
             req_draft = draft_mode if draft_mode is not None else self.draft_mode
-            if req_draft in ("two_tier", "eagle_only") and draft_head is None:
+            if req_draft == "mtp_only" and native_mtp is None:
+                eff_draft = "none"
+            elif req_draft in ("two_tier", "eagle_only") and draft_head is None and native_mtp is None:
                 eff_draft = "pld_only" if req_draft == "two_tier" else "none"
             else:
                 eff_draft = req_draft
@@ -425,6 +442,7 @@ class TensorMMUEngine:
             self.ple_offloader = ple_off
             self.manifest = manifest
             self.draft_head = draft_head
+            self.native_mtp = native_mtp
             self.lookahead_bank = lookahead_bank
             self.active_nvm_dir = cart_dir
             self.active_model_id = model_id
@@ -549,6 +567,7 @@ class TensorMMUEngine:
             "default_max_tokens": self.default_max_tokens,
             "default_thinking_budget": self.default_thinking_budget,
             "has_eagle_draft_head": self.draft_head is not None,
+            "has_native_mtp": self.native_mtp is not None,
             "has_lookahead_bank": self.lookahead_bank is not None,
             "confidence_gated_moe": self.confidence_gated_moe,
             "hardware_fit": self.fit_assessment.to_dict() if self.fit_assessment is not None else None,
@@ -718,6 +737,8 @@ class TensorMMUEngine:
             h_verified = h_prefill[:, -1:, :].clone()
             ctx_tail = h_prefill[:, -min(8, int(h_prefill.shape[1])) :, :]
             c_ema = ctx_tail.mean(dim=1, keepdim=True).clone()
+            if self.native_mtp is not None and use_greedy_spec and eff_draft_mode in ("two_tier", "mtp_only"):
+                self.native_mtp.prefill_from_hidden(prompt_ids, h_prefill)
 
             if torch.cuda.is_available() and dev.type == "cuda":
                 torch.cuda.synchronize(dev)
@@ -843,6 +864,23 @@ class TensorMMUEngine:
                             )
                             if draft_toks:
                                 draft_source = "eagle"
+                    elif eff_draft_mode == "mtp_only":
+                        if self.native_mtp is not None:
+                            all_mapped_now = bool(
+                                self.paged_layers
+                                and all(getattr(m.tlb_cache, "all_experts_mapped", False) for m in self.paged_layers.values())
+                            )
+                            k_mtp = min(3 if all_mapped_now else 1, k_budget)
+                            min_c = 0.25 if all_mapped_now else 0.55
+                            draft_toks, _ = self.native_mtp.draft_k_tokens(
+                                last_tok_id=last_tok,
+                                last_hidden=h_verified,
+                                max_draft_tokens=k_mtp,
+                                min_conf=min_c,
+                                eos_ids=eos_ids,
+                            )
+                            if draft_toks:
+                                draft_source = "mtp"
                     elif eff_draft_mode == "two_tier":
                         is_moe_graph = runner_bound and not allow_2gram_pld
                         pld_min_ord = 4 if is_moe_graph else 3
@@ -853,6 +891,23 @@ class TensorMMUEngine:
                         if cand_pld and matched_n >= pld_min_ord:
                             draft_toks = cand_pld
                             draft_source = "pld"
+                        elif self.native_mtp is not None:
+                            all_mapped_now = bool(
+                                self.paged_layers
+                                and all(getattr(m.tlb_cache, "all_experts_mapped", False) for m in self.paged_layers.values())
+                            )
+                            k_mtp = min(3 if all_mapped_now else 1, k_budget)
+                            min_c = 0.25 if all_mapped_now else 0.55
+                            cand_mtp, _ = self.native_mtp.draft_k_tokens(
+                                last_tok_id=last_tok,
+                                last_hidden=h_verified,
+                                max_draft_tokens=k_mtp,
+                                min_conf=min_c,
+                                eos_ids=eos_ids,
+                            )
+                            if cand_mtp:
+                                draft_toks = cand_mtp
+                                draft_source = "mtp"
                         elif not is_moe_graph:
                             if self.draft_head is not None:
                                 k_eag = min(gen_helper.max_draft_tokens, k_budget)
@@ -967,6 +1022,8 @@ class TensorMMUEngine:
                     if use_graph_step:
                         assert runner is not None
                         runner.finalize_step(M, max(1, valid_kv_added))
+                        if self.native_mtp is not None:
+                            self.native_mtp.commit_verified_tokens(n_acc)
                         if K > 0:
                             for mlp in self.paged_layers.values():
                                 if hasattr(mlp, "commit_speculative_step"):
@@ -975,9 +1032,13 @@ class TensorMMUEngine:
                         from runtime.qwen3_next_kernels import finalize_or_rollback_hybrid_cache
 
                         finalize_or_rollback_hybrid_cache(pkv, M, max(1, valid_kv_added))
+                        if self.native_mtp is not None:
+                            self.native_mtp.commit_verified_tokens(n_acc)
                         for mlp in self.paged_layers.values():
                             if hasattr(mlp, "commit_speculative_step"):
                                 mlp.commit_speculative_step(n_acc)
+                    elif self.native_mtp is not None:
+                        self.native_mtp.commit_verified_tokens(0)
 
                     last_valid_pos = max(0, valid_kv_added - 1)
                     h_verified = h_step_all[:, last_valid_pos : last_valid_pos + 1, :].clone()

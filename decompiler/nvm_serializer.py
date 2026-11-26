@@ -1393,6 +1393,147 @@ def _populate_layer_bf16_from_reader(
 
 
 @torch.no_grad()
+def _compile_native_mtp_from_reader(
+    reader: SafetensorShardReader,
+    src_dir: str,
+    out_dir: str,
+    attn_quant: str,
+    attn_group_size: int,
+    shared_mlp_quant: str,
+    expert_group_size: int,
+    expert_chunk_size: int,
+    tlb_slots: int,
+    device: str,
+    dtype: torch.dtype,
+    lut_pool: SharedQuantLUTPool,
+) -> Optional[Dict[str, Any]]:
+    """Stream-compiles native HF `mtp.*` weights (`Qwen3-Next` / `DeepSeek-V3`) into `mtp_core.safetensors` + `mtp_experts.safetensors`."""
+    dev = torch.device(device)
+    fc_key = "mtp.fc.weight" if reader.has_key("mtp.fc.weight") else "mtp.eh_proj.weight"
+    if not reader.has_key(fc_key):
+        return None
+    emb_norm_key = "mtp.pre_fc_norm_embedding.weight" if reader.has_key("mtp.pre_fc_norm_embedding.weight") else "mtp.enorm.weight"
+    hid_norm_key = "mtp.pre_fc_norm_hidden.weight" if reader.has_key("mtp.pre_fc_norm_hidden.weight") else "mtp.hnorm.weight"
+    out_norm_key = "mtp.norm.weight" if reader.has_key("mtp.norm.weight") else "mtp.shared_head.norm.weight"
+    if not (reader.has_key(emb_norm_key) and reader.has_key(hid_norm_key) and reader.has_key(out_norm_key)):
+        return None
+
+    print("[StreamMoECompile] Detected native HF `mtp.*` weights — compiling CUDA-Graph MTP drafter...", flush=True)
+    # Build a fresh 1-layer skeleton cloned from a full-attention decoder layer
+    tmp_model, _ = _create_empty_skeleton(src_dir, dtype=dtype, skip_multimodal=True)
+    dec_layers = resolve_decoder_layers(tmp_model)
+    full_attn_lyr = next((l for l in dec_layers if hasattr(l, "self_attn") and l.self_attn is not None), dec_layers[-1])
+    valid_layer_keys = {k for k, _ in full_attn_lyr.named_parameters()} | {k for k, _ in full_attn_lyr.named_buffers()}
+
+    # Load non-expert MTP layer tensors (`mtp.layers.0.*`) onto GPU
+    l_prefix = "mtp.layers.0."
+    moe_info = _locate_layer_moe_components(full_attn_lyr)
+    exp_rel = moe_info["experts_rel"] if moe_info is not None else None
+    non_exp_keys = {k for k in valid_layer_keys if not (exp_rel and (k == exp_rel or k.startswith(f"{exp_rel}.")))}
+
+    raw_layer = reader.get_prefix_tensors(
+        l_prefix, strip_prefix=True, device=device, dtype=dtype, allowed_rel_keys=non_exp_keys
+    )
+    for rel_k, t_gpu in raw_layer.items():
+        _set_tensor_by_qualname(full_attn_lyr, rel_k, t_gpu)
+    del raw_layer
+    _move_cpu_buffers_to_device(full_attn_lyr, dev)
+    full_attn_lyr.eval()
+
+    q_meta = _quantize_layer_self_attn(full_attn_lyr, attn_quant, attn_group_size, device, dtype, lut_pool)
+    if moe_info is not None and shared_mlp_quant != "none" and moe_info.get("shared_mlp_mod") is not None:
+        q_meta.update(
+            _quantize_layer_mlp_linear(
+                full_attn_lyr,
+                moe_info["shared_mlp_mod"],
+                moe_info["shared_mlp_rel"],
+                shared_mlp_quant,
+                attn_group_size,
+                device,
+                dtype,
+                lut_pool,
+            )
+        )
+
+    has_moe_experts = False
+    exp_meta: Dict[str, Any] = {}
+    if moe_info is not None and exp_rel is not None:
+        E = int(moe_info["num_experts"])
+        D = int(moe_info["d_model"])
+        I = int(moe_info["d_ffn"])
+        layout = ContiguousExpertPageLayout.compute(d_model=D, d_ffn=I, group_size=expert_group_size)
+        pages_cpu = torch.zeros((E, layout.page_bytes), dtype=torch.uint8, device="cpu")
+        for s_e in range(0, E, max(1, int(expert_chunk_size))):
+            e_end = min(E, s_e + max(1, int(expert_chunk_size)))
+            w_gu, w_dn = _read_moe_expert_chunk(reader, l_prefix, exp_rel, s_e, e_end, device=device, dtype=dtype)
+            ch_pages, _ = quantize_pack_moe_experts_uint4(
+                w_gu, w_dn, group_size=expert_group_size, compute_device=device, expert_chunk_size=e_end - s_e
+            )
+            pages_cpu[s_e:e_end].copy_(ch_pages)
+            del w_gu, w_dn, ch_pages
+        save_file(
+            {"pages": pages_cpu, "freq_rank": torch.arange(E, dtype=torch.int32)},
+            os.path.join(out_dir, "mtp_experts.safetensors"),
+        )
+        del pages_cpu
+        has_moe_experts = True
+        exp_meta = {
+            "experts_file": "mtp_experts.safetensors",
+            "experts_rel": exp_rel,
+            "num_experts": E,
+            "moe_d_ffn": I,
+            "expert_layout": layout.to_dict(),
+            "tlb_slots": min(E, max(16, int(tlb_slots))),
+        }
+
+    # Export `mtp_core.safetensors` keeping `pre_fc_norm_*`, `fc`, and `norm` strictly unquantized BF16!
+    core_tensors: Dict[str, torch.Tensor] = {
+        "pre_fc_norm_embedding.weight": reader.get_tensor(emb_norm_key, device="cpu", dtype=dtype),
+        "pre_fc_norm_hidden.weight": reader.get_tensor(hid_norm_key, device="cpu", dtype=dtype),
+        "fc.weight": reader.get_tensor(fc_key, device="cpu", dtype=dtype),
+        "norm.weight": reader.get_tensor(out_norm_key, device="cpu", dtype=dtype),
+    }
+    layer_cpu = _export_module_cpu_tensors(full_attn_lyr, skip_submodules=(exp_rel,) if exp_rel else ())
+    for k_l, t_l in layer_cpu.items():
+        core_tensors[f"layer.{k_l}"] = t_l
+    save_file(core_tensors, os.path.join(out_dir, "mtp_core.safetensors"))
+    del core_tensors, layer_cpu
+
+    cfg_obj = getattr(tmp_model.config, "text_config", tmp_model.config)
+    sa = full_attn_lyr.self_attn
+    d_model = int(getattr(cfg_obj, "hidden_size", 2048))
+    h_q = int(getattr(sa, "num_heads", None) or getattr(cfg_obj, "num_attention_heads", 16))
+    h_kv = int(getattr(sa, "num_key_value_heads", None) or getattr(cfg_obj, "num_key_value_heads", 2))
+    d_h = int(getattr(sa, "head_dim", d_model // max(1, h_q)))
+    arch_str = str(getattr(cfg_obj, "model_type", "qwen3_next"))
+    unit_off = "qwen3_next" in arch_str.lower() or "gemma" in arch_str.lower()
+
+    meta: Dict[str, Any] = {
+        "format_version": "tmmu_mtp_v1",
+        "arch_kind": arch_str,
+        "d_model": d_model,
+        "num_q_heads": h_q,
+        "num_kv_heads": h_kv,
+        "head_dim": d_h,
+        "rms_norm_eps": float(getattr(cfg_obj, "rms_norm_eps", 1e-6)),
+        "unit_offset_norm": unit_off,
+        "act_kind": "silu" if "qwen" in arch_str.lower() or "deepseek" in arch_str.lower() else "gelu_tanh",
+        "quant_linears": q_meta,
+        "has_moe_experts": has_moe_experts,
+        **exp_meta,
+    }
+    with open(os.path.join(out_dir, "mtp_meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+    del tmp_model, full_attn_lyr
+    gc.collect()
+    if torch.cuda.is_available() and dev.type == "cuda":
+        torch.cuda.empty_cache()
+    print(f"[StreamMoECompile] Native MTP layer compiled -> mtp_core.safetensors (MoE={has_moe_experts}).", flush=True)
+    return meta
+
+
+@torch.no_grad()
 def compile_streaming_moe_to_nvm(
     model_id_or_path: str,
     nvm_dir: str,
@@ -1878,6 +2019,24 @@ def compile_streaming_moe_to_nvm(
             f"shared_mlp={shared_mlp_quant}) flushed in {dt_l:.2f}s | Peak Compile VRAM={peak_layer_vram_mb:.1f} MB"
         )
 
+    # Optional: compile native Hugging Face `mtp.*` layer (`Qwen3-Next` / `DeepSeek-V3`) if present in shards!
+    mtp_meta: Optional[Dict[str, Any]] = None
+    if reader.has_key("mtp.fc.weight") or reader.has_key("mtp.eh_proj.weight"):
+        mtp_meta = _compile_native_mtp_from_reader(
+            reader=reader,
+            src_dir=src_dir,
+            out_dir=out_dir,
+            attn_quant=attn_quant,
+            attn_group_size=attn_group_size,
+            shared_mlp_quant=shared_mlp_quant,
+            expert_group_size=expert_group_size,
+            expert_chunk_size=expert_chunk_size,
+            tlb_slots=min(64, int(tlb_slots)),
+            device=device,
+            dtype=dtype,
+            lut_pool=lut_pool,
+        )
+
     total_disk_bytes = 0
     pages_disk_bytes = 0
     ple_disk_bytes = 0
@@ -1908,6 +2067,7 @@ def compile_streaming_moe_to_nvm(
         "expert_group_size": expert_group_size,
         "tlb_slots": tlb_slots,
         "ple_meta": ple_meta,
+        "mtp_meta": mtp_meta,
         "compile_telemetry": {
             "compile_wall_s": compile_wall_s,
             "peak_preamble_vram_mb": peak_preamble_vram_mb,
