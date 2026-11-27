@@ -309,8 +309,82 @@ class TensorMMUEngine:
             self.lifecycle_progress_pct = progress_pct
             self.lifecycle_error = error
 
+    def save_warm_tlb_profile(self) -> bool:
+        """Persists each MoE layer's warmed L1+L2 expert rank order into `<cart_dir>/warm_tlb_profile.json`."""
+        if not self.active_nvm_dir or not self.paged_layers:
+            return False
+        if os.environ.get("TMMU_DISABLE_WARM_PROFILE", "").strip() == "1":
+            return False
+        moe_layers = {k: v for k, v in self.paged_layers.items() if isinstance(v, SparseMoETLBExperts)}
+        if not moe_layers:
+            return False
+        total_activity = sum(
+            int(m.tlb_cache._page_hits + m.tlb_cache._l2_zero_copy_hits) for m in moe_layers.values()
+        )
+        if total_activity < 500:
+            return False
+        profile: Dict[str, List[int]] = {}
+        for l_idx, m in moe_layers.items():
+            tlb = m.tlb_cache
+            # Order currently hot L1 experts by recency (`_slot_last_used`), then warm L2 experts, then remaining ranks
+            l1_pairs = [
+                (int(tlb._slot_last_used[s]), int(e))
+                for s, e in enumerate(tlb._slot_to_expert)
+                if 0 <= int(e) < tlb.num_experts
+            ]
+            l1_pairs.sort(key=lambda x: x[0], reverse=True)
+            ordered: List[int] = [e for _, e in l1_pairs]
+            seen = set(ordered)
+            for e in tlb._l2_slot_to_expert:
+                ei = int(e)
+                if 0 <= ei < tlb.num_experts and ei not in seen:
+                    ordered.append(ei)
+                    seen.add(ei)
+            for e in tlb.freq_rank_list:
+                ei = int(e)
+                if ei not in seen:
+                    ordered.append(ei)
+                    seen.add(ei)
+            profile[str(l_idx)] = ordered
+        out_path = os.path.join(self.active_nvm_dir, "warm_tlb_profile.json")
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(profile, f)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _apply_warm_tlb_profile(cart_dir: str, paged_layers: Dict[int, Any]) -> bool:
+        """Restores warmed L1+L2 expert seeding from `<cart_dir>/warm_tlb_profile.json` if present."""
+        if os.environ.get("TMMU_DISABLE_WARM_PROFILE", "").strip() == "1":
+            return False
+        prof_path = os.path.join(cart_dir, "warm_tlb_profile.json")
+        if not os.path.isfile(prof_path):
+            return False
+        try:
+            with open(prof_path, "r", encoding="utf-8") as f:
+                profile = json.load(f)
+            if not isinstance(profile, dict):
+                return False
+            applied = False
+            for l_idx, m in paged_layers.items():
+                if not isinstance(m, SparseMoETLBExperts) or m.mode != "vm_paged":
+                    continue
+                ranks = profile.get(str(l_idx))
+                if isinstance(ranks, list) and len(ranks) == m.num_experts:
+                    m.tlb_cache.freq_rank_list = [int(x) for x in ranks]
+                    m.tlb_cache.clear_cache()
+                    m.tlb_cache.seed_default_experts()
+                    m.tlb_cache._reseed_l2_disjoint_from_l1()
+                    applied = True
+            return applied
+        except Exception:
+            return False
+
     def _unload_current(self) -> None:
         if self.model is not None:
+            self.save_warm_tlb_profile()
             runner = getattr(self.model, "_nvm_graph_runner", None)
             if runner is not None:
                 runner.release()
@@ -392,6 +466,7 @@ class TensorMMUEngine:
                 use_phase_c_kernels=True,
                 load_tokenizer=True,
             )
+            self._apply_warm_tlb_profile(cart_dir, paged_layers)
 
             draft_head: Optional[EagleLiteDraftHead] = None
             if _has_eagle_draft_head(cart_dir):

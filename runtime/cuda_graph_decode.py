@@ -1410,13 +1410,16 @@ class CUDAGraphDecodeRunner:
             tlb.stage_synced_topk(plan.topk_idx_bufs[r_i], cur_flat)
             tlb._serviced_topk_ptr = 0
             tlb._serviced_topk_numel = 0
+            had_dma = False
             if tlb._dma_in_flight and tlb._dma_event is not None:
                 comp_stream.wait_event(tlb._dma_event)
                 tlb._dma_in_flight = False
+                had_dma = True
 
             # 5. Replay fused `MoE_r + PreMoE_{r+1}` (or `MoE_{R-1} + norm + lm_head + argmax`)!
             plan.moe_and_next_graphs[r_i].replay()
-            tlb.record_compute_read(comp_stream)
+            if had_dma or moe_m._queued_lookahead_experts:
+                tlb.record_compute_read(comp_stream)
             moe_m._dispatch_queued_lookahead()
 
         self._done_event.record(comp_stream)

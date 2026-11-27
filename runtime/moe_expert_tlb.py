@@ -1307,8 +1307,28 @@ class GPUExpertTLBCache(nn.Module):
         """Stages missed Layer `l` pages onto `dma_stream` WHILE GPU Shared MLP runs on `compute_stream`."""
         if cur_flat is None or self.all_experts_mapped:
             return
-        if self.tlb_slots <= 0 and self.l2_zero_copy_dev_ptr == 0:
+        if self.tlb_slots <= 0 and not self.has_l2_mapped:
             return
+        # Zero-allocation All-Hit Fast-Path: when every routed expert is already in L1 VRAM or L2 Zero-Copy
+        # (90%+ of layers on warm decode!), skip Python set/dict/LRU churn on 3 out of 4 steps!
+        if not self._has_any_lookahead_pending and (self._all_hit_fastpaths & 3) != 3:
+            e2s = self._expert_to_slot
+            l2_h = self._expert_l2_home
+            has_l2 = self.has_l2_mapped
+            n_exp = self.num_experts
+            all_hit = True
+            for xi in cur_flat:
+                if 0 <= xi < n_exp:
+                    if e2s[xi] < 0 and not (has_l2 and l2_h[xi] >= 0):
+                        all_hit = False
+                        break
+            if all_hit:
+                self._page_hits += len(cur_flat)
+                self._all_hit_fastpaths += 1
+                self._dma_in_flight = False
+                self._serviced_topk_ptr = int(top_k_index.data_ptr())
+                self._serviced_topk_numel = len(cur_flat)
+                return
         T = int(top_k_index.shape[0])
         K = int(top_k_index.shape[1])
         token_rows = [cur_flat[t * K : (t + 1) * K] for t in range(T)]

@@ -309,8 +309,11 @@ def assess_cartridge_fit(
         min_viable_gb = core_vram_gb + min_slots * gb_per_slot
         all_res_gb = core_vram_gb + total_expert_gb
 
-        # Reserve generous KV + graph pool headroom (at least 3.5 GiB or 16% of free VRAM, plus 12K KV)
-        kv_headroom_gb = max(3.2, min(12.0, hw.free_vram_gb * 0.16), (kv_per_1k_mb * 12.0) / 1024.0)
+        # Reserve KV + graph pool headroom (hybrid/linear-attn models with <=40 MiB/1K KV need far less headroom!)
+        if kv_per_1k_mb <= 40.0:
+            kv_headroom_gb = max(1.8, (kv_per_1k_mb * 16.0) / 1024.0 + 1.2)
+        else:
+            kv_headroom_gb = max(3.0, min(12.0, hw.free_vram_gb * 0.14), (kv_per_1k_mb * 12.0) / 1024.0)
         kv_32k_headroom_gb = max(kv_headroom_gb, (kv_per_1k_mb * 32.0) / 1024.0 + 1.5)
         usable_for_slots_gb = max(0.0, hw.free_vram_gb - core_vram_gb - kv_headroom_gb)
         max_safe_slots = int(usable_for_slots_gb // max(1e-6, gb_per_slot)) if gb_per_slot > 0 else num_experts
@@ -328,7 +331,7 @@ def assess_cartridge_fit(
                 rec_mode = "all_resident"
                 rec_slots = num_experts
         elif requested_tlb_slots is not None:
-            hard_cap_slots = int(max(0.0, hw.free_vram_gb - core_vram_gb - 1.5) // max(1e-6, gb_per_slot))
+            hard_cap_slots = int(max(0.0, hw.free_vram_gb - core_vram_gb - 1.0) // max(1e-6, gb_per_slot))
             if hw.cuda_available and requested_tlb_slots > hard_cap_slots and hard_cap_slots >= min_slots:
                 warnings.append(
                     f"Requested `tlb_slots={requested_tlb_slots}` (~{core_vram_gb + requested_tlb_slots * gb_per_slot:.1f} GiB) "
