@@ -8,9 +8,10 @@ Modern CPUs do not require an entire binary to fit in L1/L2 cache before executi
 
 **TensorMMU** applies that exact computer-architecture design to Sparse Mixture-of-Experts (`MoE`) LLMs such as **`Qwen/Qwen3-Next-80B-A3B-Instruct`** (`512` experts/layer, `1.95%` active per token) and **`google/gemma-4-26B-A4B-it`** (`128` experts/layer, `6.25%` active per token):
 
-- **L1 GPU VRAM TLB Cache (`1,008 GB/s` on RTX 4090 / `3.35 TB/s` on H100):** Keeps the always-active trunk + hottest `K` 4 KB-aligned `UINT4` expert pages resident on GPU.
-- **L2 Zero-Copy Pinned DDR5 (`cudaHostAllocMapped`, `~15.9 GB/s` PCIe 4.0 x16):** Maps warm expert pages into pinned host memory so GPU SMs read L1 misses directly over PCIe with **zero CPU sync** inside **Full CUDA Graphs**.
-- **L3 NVMe Pinned DMA Ring (`32-slot` async staging, `~22.9 GB/s`):** Streams unmapped cold misses from disk overlapped behind Shared-MLP compute while Attention/GDN segments run inside **Piecewise CUDA Graphs**.
+- **L1 GPU VRAM TLB Cache (`1,008 GB/s` on RTX 4090 / `3.35 TB/s` on H100):** Keeps the always-active trunk + hottest `K` 4 KB-aligned `UINT4` expert pages resident on GPU, with hybrid-KV VRAM reclamation (`186–191` L1 slots on 24 GB) and persistent warm TLB profiles (`warm_tlb_profile.json`).
+- **L2 Zero-Copy Pinned DDR5 (`cuMemHostAlloc` + `UINT4-WINA` / `UINT3-WINA`):** Allocates exact-byte device-mapped pinned RAM (zero PyTorch power-of-2 slab waste) and runs Gate-First conditional neuron-major PCIe fetch (`UINT3-WINA` shrinks L2 pages `-30%` to `1.316 MiB`, fitting `206` experts/layer in `12.7 GiB` DDR5).
+- **L3 NVMe Pinned DMA Ring + Hardware-Tier Cold Expert Dropping:** Streams unmapped cold misses behind Shared-MLP compute with Cross-Layer `INT8` Lookahead Routers, while CUDA-Graphed `prune_cold_l3_routes` skips tiny-weight unmapped L3 outliers (`slot == -1`) on GPU with zero syncs.
+- **CUDA-Graphed Native `mtp.*` + `PLD` Two-Tier Speculative Decoding:** Loads official Hugging Face `mtp.*` heads (e.g., `Qwen3-Next-80B`'s 1,553 MTP tensors) in `+190 MiB` VRAM, achieving `~85–92%` draft acceptance (`2.3–2.6 tok/step`) with dynamic warm `K=2/K=3` gating.
 - **Agent-Ready OpenAI + Anthropic Endpoints & Native Tool Calling:** Serves `/v1/chat/completions` **and** `/v1/messages` (Claude Code, Anthropic SDK, Oh My Pi, Cline, Cursor) with structured `tool_calls` / `tool_use`, `max_tokens=32768` + `thinking_token_budget=6144` defaults, and `O(1)`-overhead growable KV caches.
 
 ---
@@ -19,9 +20,36 @@ Modern CPUs do not require an entire binary to fit in L1/L2 cache before executi
 
 | Model | Total / Active | Cartridge Size | Allocated GPU VRAM | TTFT | Decode Throughput | GSM8K CoT |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: |
-| **`Gemma-4-26B-A4B-it`** | 26B / 3.8B (`128E` top-8) | 15.3 GB | **8.15 GiB** (`48` L1 + `80` L2) | `523 ms` | **49.1 – 55.2 tok/s** | 100% |
-| **`Qwen3-Next-80B-A3B-Instruct`** | 80B / 3.0B (`512E` top-10) | 44.1 GB | **18.80 GiB** (`192` L1 + `213` L2 + `107` L3) | `4.54 s` | **28.4 tok/s** (`34.5` peak) | 100% |
+| **`Qwen3-Next-80B-A3B-Instruct`** *(Turbo Warm)* | 80B / 3.0B (`512E` top-10) | 44.0 GB | **18.80 GiB** (`186` L1 + `206` L2 `UINT3-WINA` + `120` L3) | `2.6 s` | **39.7 tok/s** (**`62.3` peak**) | **100%** (5/5) |
+| **`Gemma-4-26B-A4B-it`** | 26B / 3.8B (`128E` top-8) | 15.3 GB | **8.15 GiB** (`48` L1 + `80` L2) | `523 ms` | **49.1 – 55.2 tok/s** | **100%** (5/5) |
 | *Naive BF16 Layer Offloading* | 80B / 3.0B | 160 GB | 22.40 GiB | `14.2 s` | *0.38 tok/s* | 100% |
+
+### How We Took `Qwen3-Next-80B` from `16.8 -> 62.3 tok/s` (`3.22×` Peak Speedup)
+
+Each optimization below was benchmarked back-to-back on the exact same 5-problem GSM8K suite on a single RTX 4090 (24 GB) + 32 GB DDR5 PC:
+
+| Milestone | L1 / L2 Slots | Mean `tok/s` | Peak `tok/s` | L3 NVMe Misses | `TLB` Hit % | GSM8K |
+| :--- | :---: | ---: | ---: | ---: | ---: | :---: |
+| **1. Baseline `UINT4`** (`L2=94`, no WINA / MTP / Lookahead) | `170 / 94` | `16.79` (`1.00×`) | `19.37` (`1.00×`) | — | `92.8%` | `5/5` |
+| **2. + Exact-Byte `cuMemHostAlloc` L2 + Lookahead + `UINT4-WINA` + Native `mtp.*` (`K=1`)** | `170 / 137` | `21.55` (`1.28×`) | `29.83` (`1.54×`) | `14,377` | `96.6%` | `5/5` |
+| **3. + CUDA-Graphed Cold L3 Drop (`9%`) + Dynamic Warm `K=2` MTP** | `170 / 137` | `28.18` (`1.68×`) | `38.46` (`1.99×`) | `5,920` (`-59%`) | `98.3%` | `5/5` |
+| **4. + `UINT3-WINA 65%` Cold L2 (`1.316 MiB/exp`, `-30%` RAM)** | `170 / 196` | `29.46` (`1.75×`) | `40.32` (`2.08×`) | `3,497` (`-76%`) | `99.0%` | `5/5` |
+| **5. + Hybrid-KV VRAM Reclaim + All-Hit Fast Piecewise + `two_tier` (Cold)** | `191 / 206` | `31.20` (`1.86×`) | `48.25` (`2.49×`) | `3,106` | `99.4%` | `4/5`* |
+| **6. + Persistent Warm TLB Profile (`warm_tlb_profile.json` Restart)** | **`186 / 206`** | **`39.66` (`2.36×`)** | **`62.34` (`3.22×`)** | **`1,125` (`-92%`)** | **`99.8%`** | **`5/5`** |
+
+- **Exact-Byte `cuMemHostAlloc` Flexible L2:** Eliminates PyTorch `CachingHostAllocator`'s power-of-2 slab rounding (which silently wasted ~2× pinned RAM per layer) and scales L2 dynamically to free host RAM instead of a fixed cap.
+- **`UINT4-WINA` & `UINT3-WINA` Gate-First Conditional Fetch:** Computes `gate_proj` first on L2 Zero-Copy hits, scores neuron salience (`|SiLU(gate)| · ||W_down[:,j]||`), and fetches only the top-`k` `(up_j, down_j)` neuron slabs over PCIe. In 3-bit mode (`--l2-wina-bits 3`), exact `32-weights-into-3-uint32` packing shrinks L2 pages `-30%` (`1.875 -> 1.316 MiB`), expanding L2 capacity `+43%` (`137 -> 196–206` experts/layer).
+- **CUDA-Graphed Hardware-Tier Cold L3 Expert Dropping (`--cold-drop-weight`):** Checks `gpu_expert_to_slot` live inside the CUDA Graph with zero extra syncs and drops an expert **only** if it is both physically unmapped on slow L3 NVMe (`slot == -1`) and below the normalized router-weight threshold (never touching L1/L2 hits or top-1), renormalizing remaining weights.
+- **CUDA-Graphed Native `mtp.*` + `PLD` (`two_tier`):** Uses the model's official multi-token prediction head (`+190 MiB` VRAM) with a rolling L3-miss EMA gate that automatically unlocks `K=2` when warm (`K=3` when 100% L1+L2 mapped), averaging `2.32 tok/step`.
+- **Hybrid-KV VRAM Reclaim + All-Hit Fast Piecewise + Persistent Warm TLB:** Reclaims unused VRAM on low-KV hybrid models (`GatedDeltaNet`, `24 MiB / 1K`), skips Python LRU/set churn on all-hit layers, and persists warmed L1+L2 expert ranks across restarts (`warm_tlb_profile.json`).
+
+```powershell
+# Default conservative serve (UINT4-WINA 50%, cold-drop 6%):
+tmmu serve --model checkpoints/Qwen3-Next-80B-A3B-Instruct.tmmu --port 8000
+
+# Turbo 80B mode (UINT3-WINA 65% + ColdDrop 9%, up to 62.3 tok/s on RTX 4090 + 32 GB RAM):
+tmmu serve --model checkpoints/Qwen3-Next-80B-A3B-Instruct.tmmu --l2-wina-bits 3 --l2-wina-ratio 0.65 --cold-drop-weight 0.09
+```
 
 Open `docs/index.html` (or visit `http://localhost:8000/about` when running the server) for the full architecture walkthrough and Dense vs. Sparse-MoE findings.
 
@@ -189,7 +217,7 @@ TensorMMU sits directly alongside recent architectural work from **Google** and 
 ## Repository Layout
 
 - `tensormmu/` — Unified CLI (`tmmu check`, `tmmu compile`, `tmmu serve`), GPU/RAM/cgroup/disk safety checks (`hardware_safety.py`), streaming compiler wrapper (`compiler.py`), and OpenAI + Anthropic tool-call protocol engine (`tool_parser.py`).
-- `runtime/` — NVRTC CUDA MoE-TLB & Zero-Copy kernels (`moe_tlb_kernels.py`), 3-tier TLB cache manager (`moe_expert_tlb.py`), growable Full/Piecewise CUDA Graph decode runner (`cuda_graph_decode.py`), GatedDeltaNet fused kernels (`qwen3_next_kernels.py`), speculative decoding (`speculative_vm.py`), and HTTP/SSE server (`openai_server.py`).
+- `runtime/` — NVRTC CUDA MoE-TLB, `UINT4-WINA`/`UINT3-WINA` & exact-byte `cuMemHostAlloc` Zero-Copy kernels (`moe_tlb_kernels.py`), 3-tier TLB cache & Cold L3 Drop manager (`moe_expert_tlb.py`), growable Full/Piecewise CUDA Graph decode runner (`cuda_graph_decode.py`), CUDA-graphed Native `mtp.*` drafter (`native_mtp.py`), GatedDeltaNet fused kernels (`qwen3_next_kernels.py`), speculative decoding (`speculative_vm.py`), and HTTP/SSE server (`openai_server.py`).
 - `decompiler/` — `O(1)`-VRAM single-layer streaming `.safetensors -> .tmmu/.nvm` serializer (`nvm_serializer.py`).
 - `docs/index.html` — Standalone technical explanation website (also served at `GET /about`).
 - `benchmarks/` — Historical Phase 1–H research & benchmark reproduction scripts plus archived RTX 4090 JSON telemetry (`benchmarks/results/`).

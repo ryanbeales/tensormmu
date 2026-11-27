@@ -158,8 +158,8 @@
 
     <div class="stat-grid">
       <div class="stat-card">
-        <div class="k">28.4 – 34.5 <span>tok/s</span></div>
-        <div class="lbl">Qwen3-Next-80B-A3B (44 GB) on 1× RTX 4090 (18.8 GB VRAM, 100% GSM8K)</div>
+        <div class="k">39.7 – 62.3 <span>tok/s</span></div>
+        <div class="lbl">Qwen3-Next-80B-A3B (44 GB) on 1× RTX 4090 + 32 GB RAM (18.8 GiB VRAM, 5/5 GSM8K)</div>
       </div>
       <div class="stat-card">
         <div class="k">49.1 – 55.2 <span>tok/s</span></div>
@@ -201,23 +201,23 @@
       </div>
       <div class="tier l2">
         <div class="tier-tag">Tier 2 · Warm Cache</div>
-        <h4>L2 Zero-Copy Pinned DDR5</h4>
-        <div class="bw">~15.9 GB/s PCIe 4.0 x16 Direct Read</div>
-        <p><code>cudaHostAllocMapped</code> pinned pages read directly over PCIe by idle SMs on L1 TLB misses — zero CPU intervention, 100% capturable in a single Full CUDA Graph.</p>
+        <h4>L2 Zero-Copy <code>UINT3/4-WINA</code> DDR5</h4>
+        <div class="bw">Exact-Byte <code>cuMemHostAlloc</code> · -30% RAM &amp; -50% PCIe</div>
+        <p>Device-mapped pinned pages with Gate-First conditional neuron fetch (<code>UINT4-WINA</code> / 3-bit <code>UINT3-WINA</code>), expanding 12.7&nbsp;GiB DDR5 from 137 to 206 experts/layer with zero PyTorch slab waste.</p>
       </div>
       <div class="tier l3">
         <div class="tier-tag">Tier 3 · Backing Store</div>
-        <h4>L3 NVMe Pinned DMA Ring</h4>
-        <div class="bw">32-Slot Async H2D Staging (~22.9 GB/s)</div>
-        <p>For 80B+ models exceeding DDR5 RAM, unmapped misses stream from 4&nbsp;KB-aligned <code>.safetensors</code> shards while Shared-MLP &amp; Attention segments replay inside Piecewise CUDA Graphs.</p>
+        <h4>L3 NVMe Ring + Cold L3 Drop</h4>
+        <div class="bw">32-Slot Async DMA · Lookahead · -92% L3 Misses</div>
+        <p>Unmapped cold misses stream overlapped behind Shared-MLP compute, while CUDA-Graphed hardware-tier pruning skips tiny-weight L3 outliers (<code>slot == -1</code>) with zero syncs.</p>
       </div>
     </div>
 
     <div class="callout">
-      <strong>Intra-Layer Shared-MLP DMA Overlap &amp; Cross-Layer Lookahead Prefetch:</strong>
-      When an L3 page fault occurs, TensorMMU launches the async PCIe H2D DMA transfer on a dedicated non-blocking stream
-      <em>before</em> running the layer's Shared Expert / Dense branch, hiding PCIe latency behind compute. Optional
-      <code>INT8</code> Cross-Layer Lookahead Routers predict layer <code>l+1</code>'s top experts from layer <code>l</code>'s residual stream.
+      <strong>CUDA-Graphed Native <code>mtp.*</code> + <code>PLD</code> Two-Tier Drafting &amp; Persistent Warm TLB:</strong>
+      TensorMMU loads official Hugging Face <code>mtp.*</code> speculative heads in just <code>+190&nbsp;MiB</code> VRAM
+      (<code>85–92%</code> acceptance, <code>2.32 tok/step</code>), pairs them with <code>0.05&nbsp;ms</code> Prompt Lookup Drafting,
+      and persists warmed L1+L2 expert ranks across restarts in <code>warm_tlb_profile.json</code> so even the first prompt hits <code>99.7%+</code> TLB locality.
     </div>
   </section>
 
@@ -261,10 +261,10 @@
         <tr>
           <td><code>Qwen3-Next-80B-A3B</code></td>
           <td>80B / 3.0B (512E top-10)</td>
-          <td><code>vm_paged</code> (192 L1 + 213 L2 + 107 L3 NVMe, Piecewise Graph)</td>
+          <td><code>vm_paged</code> (186 L1 + 206 L2 <code>UINT3-WINA</code> + ColdDrop + <code>two_tier</code> MTP, Warm)</td>
           <td class="good">18.80 GiB</td>
-          <td>4.54 s</td>
-          <td class="good">28.4 tok/s (34.5 peak)</td>
+          <td>2.60 s</td>
+          <td class="good">39.7 tok/s (62.3 peak)</td>
           <td>100%</td>
         </tr>
         <tr>
@@ -275,6 +275,77 @@
           <td>14.2 s</td>
           <td class="warn">0.38 tok/s</td>
           <td>100%</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>How We Took <code>Qwen3-Next-80B</code> from 16.8 &rarr; 62.3 tok/s (3.22&times; Peak Speedup)</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Optimization Milestone (Same RTX 4090 + 32 GB RAM, 5 GSM8K CoT)</th>
+          <th>L1 / L2 Slots</th>
+          <th>Mean tok/s</th>
+          <th>Peak tok/s</th>
+          <th>L3 Misses</th>
+          <th>TLB Hit %</th>
+          <th>GSM8K</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1. Baseline <code>UINT4</code> (no WINA, MTP, or Lookahead)</td>
+          <td>170 / 94</td>
+          <td>16.79 (1.00&times;)</td>
+          <td>19.37 (1.00&times;)</td>
+          <td>&mdash;</td>
+          <td>92.8%</td>
+          <td>5/5</td>
+        </tr>
+        <tr>
+          <td>2. + Exact-Byte <code>cuMemHostAlloc</code> L2 + Lookahead + <code>UINT4-WINA</code> + Native <code>mtp.*</code> (K=1)</td>
+          <td>170 / 137</td>
+          <td>21.55 (1.28&times;)</td>
+          <td>29.83 (1.54&times;)</td>
+          <td>14,377</td>
+          <td>96.6%</td>
+          <td>5/5</td>
+        </tr>
+        <tr>
+          <td>3. + CUDA-Graphed Cold L3 Drop (9%) + Dynamic Warm K=2 MTP</td>
+          <td>170 / 137</td>
+          <td>28.18 (1.68&times;)</td>
+          <td>38.46 (1.99&times;)</td>
+          <td>5,920 (-59%)</td>
+          <td>98.3%</td>
+          <td>5/5</td>
+        </tr>
+        <tr>
+          <td>4. + <code>UINT3-WINA</code> 65% Cold L2 (1.316 MiB/exp, -30% RAM)</td>
+          <td>170 / 196</td>
+          <td>29.46 (1.75&times;)</td>
+          <td>40.32 (2.08&times;)</td>
+          <td>3,497 (-76%)</td>
+          <td>99.0%</td>
+          <td>5/5</td>
+        </tr>
+        <tr>
+          <td>5. + Hybrid-KV VRAM Reclaim + Fast Piecewise + <code>two_tier</code> (Cold Start)</td>
+          <td>191 / 206</td>
+          <td>31.20 (1.86&times;)</td>
+          <td>48.25 (2.49&times;)</td>
+          <td>3,106</td>
+          <td>99.4%</td>
+          <td>4/5</td>
+        </tr>
+        <tr>
+          <td><strong>6. + Persistent Warm TLB Profile (<code>warm_tlb_profile.json</code> Restart)</strong></td>
+          <td class="good"><strong>186 / 206</strong></td>
+          <td class="good"><strong>39.66 (2.36&times;)</strong></td>
+          <td class="good"><strong>62.34 (3.22&times;)</strong></td>
+          <td class="good"><strong>1,125 (-92%)</strong></td>
+          <td class="good"><strong>99.8%</strong></td>
+          <td class="good"><strong>5/5</strong></td>
         </tr>
       </tbody>
     </table>
@@ -320,7 +391,7 @@
         <strong><a href="https://github.com/JustVugg/colibri" target="_blank" rel="noopener">Colibrì (<code>JustVugg/colibri</code>)</a>:</strong>
         Pure-C hierarchical <code>NVMe → RAM → GPU</code> MoE engine using raw async C file I/O and <code>.coli_usage</code> hot-store pinning.
         Colibrì is purpose-built for streaming ultra-giant <code>400B–744B</code> MoEs (<code>GLM-5</code>, <code>DeepSeek-V3</code>) from NVMe on modest rigs,
-        whereas TensorMMU targets higher single-GPU decode throughput (<code>28–55 tok/s</code>) and full OpenAI/Anthropic tool-calling in the
+        whereas TensorMMU targets higher single-GPU decode throughput (<code>39–62 tok/s</code>) and full OpenAI/Anthropic tool-calling in the
         <code>26B–120B+</code> regime via L2 Zero-Copy mapped PCIe reads and Full/Piecewise CUDA Graphs.
       </li>
       <li>
