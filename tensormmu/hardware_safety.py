@@ -309,9 +309,9 @@ def assess_cartridge_fit(
         min_viable_gb = core_vram_gb + min_slots * gb_per_slot
         all_res_gb = core_vram_gb + total_expert_gb
 
-        # Reserve KV + graph pool headroom (hybrid/linear-attn models with <=40 MiB/1K KV need far less headroom!)
+        # Reserve KV + graph pool + long-prompt prefill activation headroom
         if kv_per_1k_mb <= 40.0:
-            kv_headroom_gb = max(1.8, (kv_per_1k_mb * 16.0) / 1024.0 + 1.2)
+            kv_headroom_gb = max(2.4, (kv_per_1k_mb * 16.0) / 1024.0 + 1.6)
         else:
             kv_headroom_gb = max(3.0, min(12.0, hw.free_vram_gb * 0.14), (kv_per_1k_mb * 12.0) / 1024.0)
         kv_32k_headroom_gb = max(kv_headroom_gb, (kv_per_1k_mb * 32.0) / 1024.0 + 1.5)

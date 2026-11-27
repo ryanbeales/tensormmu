@@ -800,15 +800,49 @@ class TensorMMUEngine:
         try:
             t_start = time.perf_counter()
             p_mask = torch.ones_like(prompt_ids, dtype=torch.long, device=dev)
-            out = self.model(input_ids=prompt_ids, attention_mask=p_mask, use_cache=True)
-            pkv = out.past_key_values
+            base_trunk = getattr(self.model, "model", None)
+            lm_head_mod = getattr(self.model, "lm_head", None)
+            if base_trunk is not None and lm_head_mod is not None:
+                # Run trunk in <=2048-token chunks and evaluate `lm_head` ONLY on the last token
+                # (`0.3 MB` instead of `5.2+ GiB` logits + bounded activation VRAM on 18K-64K agent prompts!)
+                seq_len_p = int(prompt_ids.shape[1])
+                prefill_chunk = 2048
+                if seq_len_p <= prefill_chunk:
+                    base_out = base_trunk(input_ids=prompt_ids, attention_mask=p_mask, use_cache=True)
+                    pkv = base_out.past_key_values
+                    h_prefill = base_out.last_hidden_state
+                    del base_out
+                else:
+                    pkv = None
+                    h_chunks: List[torch.Tensor] = []
+                    for p_start in range(0, seq_len_p, prefill_chunk):
+                        p_end = min(seq_len_p, p_start + prefill_chunk)
+                        c_out = base_trunk(
+                            input_ids=prompt_ids[:, p_start:p_end],
+                            attention_mask=p_mask[:, :p_end],
+                            past_key_values=pkv,
+                            use_cache=True,
+                        )
+                        pkv = c_out.past_key_values
+                        h_chunks.append(c_out.last_hidden_state)
+                        del c_out
+                    h_prefill = torch.cat(h_chunks, dim=1)
+                    del h_chunks
+                last_logits = lm_head_mod(h_prefill[:, -1:, :])[0, -1]
+            else:
+                out = self.model(input_ids=prompt_ids, attention_mask=p_mask, use_cache=True)
+                pkv = out.past_key_values
+                last_logits = out.logits[0, -1]
+                assert hook.last_hidden is not None
+                h_prefill = hook.last_hidden
+                del out
 
             prompt_list = prompt_ids[0].tolist()
             if use_greedy_spec:
-                first_tok = int(out.logits[0, -1].argmax(dim=-1).item())
+                first_tok = int(last_logits.argmax(dim=-1).item())
             else:
                 first_tok = _sample_next_token(
-                    out.logits[0, -1],
+                    last_logits,
                     seen_ids=prompt_list,
                     temperature=temperature,
                     top_p=top_p,
@@ -816,14 +850,14 @@ class TensorMMUEngine:
                     repetition_penalty=repetition_penalty,
                     gen_rng=gen_rng,
                 )
+            del last_logits
 
-            assert hook.last_hidden is not None
-            h_prefill = hook.last_hidden
             h_verified = h_prefill[:, -1:, :].clone()
             ctx_tail = h_prefill[:, -min(8, int(h_prefill.shape[1])) :, :]
             c_ema = ctx_tail.mean(dim=1, keepdim=True).clone()
             if self.native_mtp is not None and use_greedy_spec and eff_draft_mode in ("two_tier", "mtp_only"):
                 self.native_mtp.prefill_from_hidden(prompt_ids, h_prefill)
+            del h_prefill, ctx_tail
 
             if torch.cuda.is_available() and dev.type == "cuda":
                 torch.cuda.synchronize(dev)

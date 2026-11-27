@@ -317,33 +317,34 @@ class NativeMTPModule(nn.Module):
         self.ensure_kv_capacity(L + 256)
         if L <= 1:
             return
-        # MTP causal alignment: position `i` fuses `embed(tok_{i+1})` with `hidden(pos_i)` for `i = 0 .. L-2`
-        emb_shift = self._get_embed_tokens()(input_ids[:, 1:])
-        h_shift = hidden_states[:, :-1, :]
-        fused = self.fc(torch.cat([self.pre_fc_norm_embedding(emb_shift), self.pre_fc_norm_hidden(h_shift)], dim=-1))
         n_pref = L - 1
-
-        # Compute K, V for all `n_pref` prompt positions in ONE vectorized prefill pass!
         lyr = self.layer
-        normed = lyr.input_layernorm(fused)
         sa = lyr.self_attn
-        k_states = sa.k_proj(normed).view(1, n_pref, self.num_kv_heads, self.head_dim)
-        v_states = sa.v_proj(normed).view(1, n_pref, self.num_kv_heads, self.head_dim)
-        if hasattr(sa, "k_norm") and sa.k_norm is not None:
-            k_states = sa.k_norm(k_states)
-        k_states = k_states.transpose(1, 2)
-        v_states = v_states.transpose(1, 2)
-
         rot = self._get_rotary_emb()
-        if rot is not None:
-            pos_ids = torch.arange(n_pref, device=self.device, dtype=torch.long).unsqueeze(0)
-            cos, sin = rot(v_states, pos_ids)
-            # Apply rotary to K only (Q is discarded during MTP prefill since we only need KV cache!)
-            _, k_states = _apply_rotary_pos_emb_static(k_states, k_states, cos, sin)
-
+        embed_fn = self._get_embed_tokens()
         assert self.k_buf is not None and self.v_buf is not None
-        self.k_buf[:, :, :n_pref, :].copy_(k_states)
-        self.v_buf[:, :, :n_pref, :].copy_(v_states)
+
+        # Chunk MTP KV prefill in 2048-token slices so 18K-32K agent prompts use < 20 MiB peak scratch VRAM!
+        chunk_sz = 2048
+        for start in range(0, n_pref, chunk_sz):
+            end = min(n_pref, start + chunk_sz)
+            c_len = end - start
+            emb_shift = embed_fn(input_ids[:, start + 1 : end + 1])
+            h_shift = hidden_states[:, start:end, :]
+            fused = self.fc(torch.cat([self.pre_fc_norm_embedding(emb_shift), self.pre_fc_norm_hidden(h_shift)], dim=-1))
+            normed = lyr.input_layernorm(fused)
+            k_states = sa.k_proj(normed).view(1, c_len, self.num_kv_heads, self.head_dim)
+            v_states = sa.v_proj(normed).view(1, c_len, self.num_kv_heads, self.head_dim)
+            if hasattr(sa, "k_norm") and sa.k_norm is not None:
+                k_states = sa.k_norm(k_states)
+            k_states = k_states.transpose(1, 2)
+            v_states = v_states.transpose(1, 2)
+            if rot is not None:
+                pos_ids = torch.arange(start, end, device=self.device, dtype=torch.long).unsqueeze(0)
+                cos, sin = rot(v_states, pos_ids)
+                _, k_states = _apply_rotary_pos_emb_static(k_states, k_states, cos, sin)
+            self.k_buf[:, :, start:end, :].copy_(k_states)
+            self.v_buf[:, :, start:end, :].copy_(v_states)
         self.cur_seq_len = n_pref
 
     @torch.no_grad()
