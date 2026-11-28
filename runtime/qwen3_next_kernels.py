@@ -1549,8 +1549,11 @@ def install_qwen3_next_fast_gdn(model: nn.Module) -> int:
         hidden_states: torch.Tensor,
         cache_params: Any = None,
         attention_mask: Optional[torch.Tensor] = None,
+        cache: Any = None,
         **kwargs: Any,
     ) -> torch.Tensor:
+        if cache_params is None:
+            cache_params = cache
         seq_len = int(hidden_states.shape[1])
         # Note: during cached decode (`seq_len <= 16`, batch=1), attention_mask is all-1s (`ones_mask_buf`),
         # and even if passed, its tail `seq_len` entries are 1; only apply mask when lengths match (`prefill`)!
