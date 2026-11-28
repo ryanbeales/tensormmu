@@ -796,15 +796,22 @@ class CUDAGraphDecodeRunner:
         self.max_seq_cap = new_cap
         return self.cur_seq_len + int(M) < self.max_seq_cap
 
-    def bind_prefill_cache(self, past_key_values: Any, seq_len: int, max_total_len: int) -> bool:
+    def bind_prefill_cache(
+        self,
+        past_key_values: Any,
+        seq_len: int,
+        max_total_len: int,
+        min_init_cap: int = 4096,
+    ) -> bool:
         """Copies prefill `DynamicCache` into static CUDA-Graph buffers (`O(1)` reuse + dynamic growth up to 32K+)."""
         if not self.is_supported or past_key_values is None:
             return False
 
         max_cap = max(2048, ((int(max_total_len) + 511) // 512) * 512)
         self.requested_max_total_len = max_cap
-        # Allocate compact initial window (`seq_len + 2048`, min 4096) so `max_tokens=32768` doesn't waste VRAM upfront!
-        init_target = min(max_cap, max(4096, ((int(seq_len) + 2048 + 511) // 512) * 512))
+        # Allocate compact initial window (`seq_len + 2048`, min `min_init_cap`) so `max_tokens=32768` doesn't waste VRAM upfront!
+        eff_min_init = max(4096, ((int(min_init_cap) + 511) // 512) * 512)
+        init_target = min(max_cap, max(eff_min_init, ((int(seq_len) + 2048 + 511) // 512) * 512))
         min_req = ((int(seq_len) + 64 + 511) // 512) * 512
         req_cap = self._safe_allocatable_seq_cap(init_target, min_req)
 

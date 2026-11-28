@@ -646,7 +646,10 @@ class TensorMMUEngine:
                 w_out = self.model(input_ids=w_ids, attention_mask=torch.ones_like(w_ids), use_cache=True)
                 runner_warm = getattr(self.model, "_nvm_graph_runner", None)
                 if runner_warm is not None and runner_warm.is_supported:
-                    if runner_warm.bind_prefill_cache(w_out.past_key_values, seq_len=2, max_total_len=4096):
+                    warm_cap = 26624 if runner_warm._kv_bytes_per_token() <= 32768 else 8192
+                    if runner_warm.bind_prefill_cache(
+                        w_out.past_key_values, seq_len=2, max_total_len=max(32768, warm_cap), min_init_cap=warm_cap
+                    ):
                         runner_warm.ensure_captured([1, 2, 3, 4] if self.draft_mode != "none" else [1])
                 del w_out
                 if torch.cuda.is_available():
@@ -1047,6 +1050,8 @@ class TensorMMUEngine:
                 ws_p = get_shared_moe_workspace(dev)
                 if int(ws_p.prefill_out_f32.numel()) > 256 * 10 * 2048:
                     ws_p.prefill_out_f32 = torch.empty((0,), dtype=torch.float32, device=dev)
+                if int(ws_p.prefill_wina_stage.numel()) > 0:
+                    ws_p.prefill_wina_stage = torch.empty((0,), dtype=torch.uint8, device=dev)
 
             if torch.cuda.is_available() and dev.type == "cuda":
                 torch.cuda.synchronize(dev)

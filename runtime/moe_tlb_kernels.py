@@ -1164,6 +1164,240 @@ extern "C" __global__ void moe_wina_up_down_q3_kernel(
         }
     }
 }
+
+// =============================================================================
+// High-Bandwidth GPU WINA -> Contiguous UINT4 Page Unpack Kernels for Prefill
+// Converts 32 staged `UINT3-WINA` / `UINT4-WINA` L2 pages into `ContiguousExpertPageLayout`
+// in ~90 us on GPU so `_run_packed_wave_list` runs register-accumulated 8-token CTAs
+// with ZERO global `atomicAdd` contention!
+// =============================================================================
+extern "C" __global__ void moe_unpack_wina_gu_kernel(
+    const uint8_t* __restrict__ src_wina_pages, // [num_pages, wina_page_bytes]
+    uint8_t* __restrict__ dst_u4_pages,         // [num_pages, u4_page_bytes]
+    int num_pages,
+    int d_ffn,
+    int n_groups_d,
+    int d_pad_half,
+    int wina_bits,
+    int wina_row_bytes,
+    int wina_slab_bytes,
+    int wina_page_bytes,
+    int wina_off_gate,
+    int wina_off_slabs,
+    int u4_page_bytes,
+    int off_gu_q4,
+    int off_gu_wmin,
+    int off_gu_scale
+) {
+    const int b = blockIdx.y;
+    if (b >= num_pages) return;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_rg = (2 * d_ffn) * n_groups_d;
+    if (idx >= total_rg) return;
+
+    const int r = idx / n_groups_d;
+    const int gd = idx - r * n_groups_d;
+
+    const uint8_t* w_page = src_wina_pages + (size_t)b * (size_t)wina_page_bytes;
+    const uint8_t* w_row = (r < d_ffn)
+        ? (w_page + wina_off_gate + (size_t)r * (size_t)wina_row_bytes)
+        : (w_page + wina_off_slabs + (size_t)(r - d_ffn) * (size_t)wina_slab_bytes);
+
+    uint8_t* d_page = dst_u4_pages + (size_t)b * (size_t)u4_page_bytes;
+    uint4* dst_q4 = (uint4*)(d_page + off_gu_q4 + (size_t)r * (size_t)d_pad_half + (size_t)gd * 32);
+    bf16_t* dst_mn = ((bf16_t*)(d_page + off_gu_wmin)) + (size_t)r * (size_t)n_groups_d + gd;
+    bf16_t* dst_sc = ((bf16_t*)(d_page + off_gu_scale)) + (size_t)r * (size_t)n_groups_d + gd;
+
+    if (wina_bits == 4) {
+        const uint4* src_q4 = ((const uint4*)w_row) + gd * 2;
+        dst_q4[0] = __ldg(&src_q4[0]);
+        dst_q4[1] = __ldg(&src_q4[1]);
+        const unsigned int ms = __ldg(&((const unsigned int*)(w_row + n_groups_d * 32))[gd]);
+        *dst_mn = (bf16_t)(ms & 0xFFFFU);
+        *dst_sc = (bf16_t)(ms >> 16);
+    } else {
+        const uint2* src_q3 = ((const uint2*)w_row) + gd * 3;
+        uint2 v0 = __ldg(&src_q3[0]);
+        uint2 v1 = __ldg(&src_q3[1]);
+        uint2 v2 = __ldg(&src_q3[2]);
+        unsigned int w[6] = {v0.x, v0.y, v1.x, v1.y, v2.x, v2.y};
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            unsigned int u0 = w[h * 3 + 0];
+            unsigned int u1 = w[h * 3 + 1];
+            unsigned int u2 = w[h * 3 + 2];
+            unsigned int q[32];
+            #pragma unroll
+            for (int i = 0; i < 10; ++i) q[i] = (u0 >> (i * 3)) & 7U;
+            q[10] = ((u0 >> 30) & 3U) | ((u1 & 1U) << 2);
+            #pragma unroll
+            for (int i = 0; i < 10; ++i) q[11 + i] = (u1 >> (1 + i * 3)) & 7U;
+            q[21] = ((u1 >> 31) & 1U) | ((u2 & 3U) << 1);
+            #pragma unroll
+            for (int i = 0; i < 10; ++i) q[22 + i] = (u2 >> (2 + i * 3)) & 7U;
+
+            unsigned int out_w[4];
+            #pragma unroll
+            for (int m = 0; m < 4; ++m) {
+                const int base = m << 3;
+                out_w[m] = q[base + 0]
+                         | (q[base + 1] << 4)
+                         | (q[base + 2] << 8)
+                         | (q[base + 3] << 12)
+                         | (q[base + 4] << 16)
+                         | (q[base + 5] << 20)
+                         | (q[base + 6] << 24)
+                         | (q[base + 7] << 28);
+            }
+            uint4 pkt = {out_w[0], out_w[1], out_w[2], out_w[3]};
+            dst_q4[h] = pkt;
+        }
+        const unsigned int ms = __ldg(&((const unsigned int*)(w_row + n_groups_d * 24))[gd]);
+        *dst_mn = (bf16_t)(ms & 0xFFFFU);
+        *dst_sc = (bf16_t)(ms >> 16);
+    }
+}
+
+extern "C" __global__ void moe_unpack_wina_dn_kernel(
+    const uint8_t* __restrict__ src_wina_pages, // [num_pages, wina_page_bytes]
+    uint8_t* __restrict__ dst_u4_pages,         // [num_pages, u4_page_bytes]
+    int num_pages,
+    int d_model,
+    int d_ffn,
+    int n_groups_d,
+    int n_groups_i,
+    int i_pad_half,
+    int wina_bits,
+    int wina_row_bytes,
+    int wina_slab_bytes,
+    int wina_page_bytes,
+    int wina_off_slabs,
+    int u4_page_bytes,
+    int off_dn_q4,
+    int off_dn_wmin,
+    int off_dn_scale
+) {
+    __shared__ float s_tile[64][65];
+    const int b = blockIdx.y;
+    if (b >= num_pages) return;
+    const int tile_idx = blockIdx.x;
+    if (tile_idx >= n_groups_d * n_groups_i) return;
+
+    const int gd = tile_idx / n_groups_i;
+    const int gi = tile_idx - gd * n_groups_i;
+    const int t = threadIdx.x; // 0..63
+
+    const uint8_t* w_page = src_wina_pages + (size_t)b * (size_t)wina_page_bytes;
+    const int j = gi * 64 + t;
+    if (j < d_ffn) {
+        const uint8_t* dn_row = w_page + wina_off_slabs + (size_t)j * (size_t)wina_slab_bytes + wina_row_bytes;
+        if (wina_bits == 4) {
+            const unsigned int ms = __ldg(&((const unsigned int*)(dn_row + n_groups_d * 32))[gd]);
+            const float mn = bf16_to_f32((bf16_t)(ms & 0xFFFFU));
+            const float sc = bf16_to_f32((bf16_t)(ms >> 16));
+            const uint4* q4 = ((const uint4*)dn_row) + gd * 2;
+            uint4 v0 = __ldg(&q4[0]);
+            uint4 v1 = __ldg(&q4[1]);
+            unsigned int words[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+            #pragma unroll
+            for (int wi = 0; wi < 8; ++wi) {
+                unsigned int w = words[wi];
+                const int base_d = wi << 3;
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    s_tile[base_d + k][t] = (float)((w >> (k << 2)) & 0x0FU) * sc + mn;
+                }
+            }
+        } else {
+            const unsigned int ms = __ldg(&((const unsigned int*)(dn_row + n_groups_d * 24))[gd]);
+            const float mn = bf16_to_f32((bf16_t)(ms & 0xFFFFU));
+            const float sc = bf16_to_f32((bf16_t)(ms >> 16));
+            const uint2* q3 = ((const uint2*)dn_row) + gd * 3;
+            uint2 v0 = __ldg(&q3[0]);
+            uint2 v1 = __ldg(&q3[1]);
+            uint2 v2 = __ldg(&q3[2]);
+            unsigned int w[6] = {v0.x, v0.y, v1.x, v1.y, v2.x, v2.y};
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                unsigned int u0 = w[h * 3 + 0];
+                unsigned int u1 = w[h * 3 + 1];
+                unsigned int u2 = w[h * 3 + 2];
+                const int bh = h << 5;
+                #pragma unroll
+                for (int i = 0; i < 10; ++i) {
+                    s_tile[bh + i][t] = (float)((u0 >> (i * 3)) & 7U) * sc + mn;
+                }
+                {
+                    unsigned int q10 = ((u0 >> 30) & 3U) | ((u1 & 1U) << 2);
+                    s_tile[bh + 10][t] = (float)q10 * sc + mn;
+                }
+                #pragma unroll
+                for (int i = 0; i < 10; ++i) {
+                    s_tile[bh + 11 + i][t] = (float)((u1 >> (1 + i * 3)) & 7U) * sc + mn;
+                }
+                {
+                    unsigned int q21 = ((u1 >> 31) & 1U) | ((u2 & 3U) << 1);
+                    s_tile[bh + 21][t] = (float)q21 * sc + mn;
+                }
+                #pragma unroll
+                for (int i = 0; i < 10; ++i) {
+                    s_tile[bh + 22 + i][t] = (float)((u2 >> (2 + i * 3)) & 7U) * sc + mn;
+                }
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int d_loc = 0; d_loc < 64; ++d_loc) {
+            s_tile[d_loc][t] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    const int d = gd * 64 + t;
+    if (d < d_model) {
+        const int rem = d_ffn - gi * 64;
+        const int valid_k = (rem >= 64) ? 64 : ((rem > 0) ? rem : 0);
+        float wmin = (valid_k > 0) ? s_tile[t][0] : 0.0f;
+        float wmax = wmin;
+        for (int k = 1; k < valid_k; ++k) {
+            float v = s_tile[t][k];
+            if (v < wmin) wmin = v;
+            if (v > wmax) wmax = v;
+        }
+        const bf16_t mn_bf = f32_to_bf16(wmin);
+        const bf16_t sc_bf = f32_to_bf16(fmaxf((wmax - wmin) * (1.0f / 15.0f), 1e-8f));
+        const float mn_f = bf16_to_f32(mn_bf);
+        const float inv_sc = 1.0f / fmaxf(bf16_to_f32(sc_bf), 1e-8f);
+
+        unsigned int out_w[8];
+        #pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            const int bk = m << 3;
+            unsigned int word = 0U;
+            #pragma unroll
+            for (int sub = 0; sub < 8; ++sub) {
+                const int kk = bk + sub;
+                unsigned int q = 0U;
+                if (kk < valid_k) {
+                    int qi = __float2int_rn((s_tile[t][kk] - mn_f) * inv_sc);
+                    if (qi < 0) qi = 0;
+                    else if (qi > 15) qi = 15;
+                    q = (unsigned int)qi;
+                }
+                word |= (q << (sub << 2));
+            }
+            out_w[m] = word;
+        }
+        uint8_t* d_page = dst_u4_pages + (size_t)b * (size_t)u4_page_bytes;
+        uint4* dst_dn_q4 = (uint4*)(d_page + off_dn_q4 + (size_t)d * (size_t)i_pad_half + (size_t)gi * 32);
+        uint4 pkt0 = {out_w[0], out_w[1], out_w[2], out_w[3]};
+        uint4 pkt1 = {out_w[4], out_w[5], out_w[6], out_w[7]};
+        dst_dn_q4[0] = pkt0;
+        dst_dn_q4[1] = pkt1;
+        ((bf16_t*)(d_page + off_dn_wmin))[(size_t)d * (size_t)n_groups_i + gi] = mn_bf;
+        ((bf16_t*)(d_page + off_dn_scale))[(size_t)d * (size_t)n_groups_i + gi] = sc_bf;
+    }
+}
 """
 
 _MOE_KERNELS_BY_DEVICE: Dict[int, Dict[str, Any]] = {}
@@ -1214,6 +1448,8 @@ def get_or_compile_moe_tlb_kernels(device: torch.device) -> Dict[str, Any]:
             "moe_wina_up_down_q4_kernel",
             "moe_wina_gate_q3_kernel",
             "moe_wina_up_down_q3_kernel",
+            "moe_unpack_wina_gu_kernel",
+            "moe_unpack_wina_dn_kernel",
         ]
         kd = _cuda_load_module(cubin_buf.raw, names)
         kd["moe_uint4_gate_up_act_kernel"].set_shared_memory_config(65536)
@@ -1407,6 +1643,7 @@ class SharedMoEWorkspace:
         self.inter_f32 = torch.empty((0,), dtype=torch.float32, device=device)
         self.out_f32 = torch.empty((0,), dtype=torch.float32, device=device)
         self.prefill_page_stage = torch.empty((0,), dtype=torch.uint8, device=device)
+        self.prefill_wina_stage = torch.empty((0,), dtype=torch.uint8, device=device)
         self.prefill_out_f32 = torch.empty((0,), dtype=torch.float32, device=device)
 
         # Compact GPU scratch buffers for `UINT4-WINA` L2 Zero-Copy conditional neuron fetch (< 1.5 MiB)
@@ -1470,10 +1707,13 @@ class SharedMoEWorkspace:
         need_out = int(chunk_tokens) * int(top_k) * int(self.max_d_model)
         if need_out > int(self.prefill_out_f32.numel()):
             self.prefill_out_f32 = torch.empty((need_out,), dtype=torch.float32, device=self.device)
-        eff_pg = max(int(self.max_page_bytes), int(extra_page_bytes))
-        need_stage = PREFILL_STAGE_SLOTS * eff_pg
+        need_stage = PREFILL_STAGE_SLOTS * int(self.max_page_bytes)
         if need_stage > int(self.prefill_page_stage.numel()):
             self.prefill_page_stage = torch.empty((need_stage,), dtype=torch.uint8, device=self.device)
+        if int(extra_page_bytes) > 0:
+            need_wina = PREFILL_STAGE_SLOTS * int(extra_page_bytes)
+            if need_wina > int(self.prefill_wina_stage.numel()):
+                self.prefill_wina_stage = torch.empty((need_wina,), dtype=torch.uint8, device=self.device)
 
     def acquire_pinned_stage_slot(self, page_bytes: int) -> Tuple[int, torch.Tensor]:
         """Returns `(slot_idx, pinned_slice)` from the 32-slot ring, waiting if `slot_idx` H2D is still in flight."""
@@ -1952,6 +2192,82 @@ class MoETLBLayerLauncher:
         )
         if (rw0 | rw2) != 0:
             raise RuntimeError(f"MoE WINA prefill wave launch failed: r=({rw0}, {rw2})")
+
+    def launch_unpack_wina_pages(
+        self,
+        wina_src_ptr: int,
+        u4_dst_ptr: int,
+        num_pages: int,
+    ) -> None:
+        """Unpacks `num_pages` staged `UINT3/4-WINA` pages into `ContiguousExpertPageLayout` on GPU in ~90 us."""
+        n_pg = int(num_pages)
+        if n_pg <= 0 or self.wina_layout is None:
+            return
+        assert self._kd is not None and self.layout.group_size == 64
+        libcuda = self._kd["libcuda"]
+        stream_h = torch.cuda.current_stream(self.device)._as_parameter_
+        wl = self.wina_layout
+        lay = self.layout
+
+        refs_gu: List[Any] = []
+        args_gu = self._build_c_args(
+            [
+                ctypes.c_void_p(int(wina_src_ptr)),
+                ctypes.c_void_p(int(u4_dst_ptr)),
+                n_pg,
+                lay.d_ffn,
+                wl.n_groups_d,
+                lay.d_pad_half,
+                wl.bits,
+                wl.row_bytes,
+                wl.slab_bytes,
+                wl.page_bytes,
+                wl.off_gate,
+                wl.off_slabs,
+                lay.page_bytes,
+                lay.off_gu_q4,
+                lay.off_gu_wmin,
+                lay.off_gu_scale,
+            ],
+            refs_gu,
+        )
+        total_rg = (2 * lay.d_ffn) * wl.n_groups_d
+        grid_gu = (total_rg + 127) // 128
+        r0 = libcuda.cuLaunchKernel(
+            self._kd["moe_unpack_wina_gu_kernel"].func,
+            grid_gu, n_pg, 1, 128, 1, 1, 0, stream_h, args_gu, None,
+        )
+
+        refs_dn: List[Any] = []
+        args_dn = self._build_c_args(
+            [
+                ctypes.c_void_p(int(wina_src_ptr)),
+                ctypes.c_void_p(int(u4_dst_ptr)),
+                n_pg,
+                lay.d_model,
+                lay.d_ffn,
+                wl.n_groups_d,
+                lay.n_groups_i,
+                lay.i_pad_half,
+                wl.bits,
+                wl.row_bytes,
+                wl.slab_bytes,
+                wl.page_bytes,
+                wl.off_slabs,
+                lay.page_bytes,
+                lay.off_dn_q4,
+                lay.off_dn_wmin,
+                lay.off_dn_scale,
+            ],
+            refs_dn,
+        )
+        grid_dn = wl.n_groups_d * lay.n_groups_i
+        r1 = libcuda.cuLaunchKernel(
+            self._kd["moe_unpack_wina_dn_kernel"].func,
+            grid_dn, n_pg, 1, 64, 1, 1, 0, stream_h, args_dn, None,
+        )
+        if (r0 | r1) != 0:
+            raise RuntimeError(f"moe_unpack_wina_pages failed: r=({r0}, {r1})")
 
     def launch_zero_and_epilogue(
         self,
