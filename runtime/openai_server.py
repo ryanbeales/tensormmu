@@ -1230,7 +1230,7 @@ class TensorMMUEngine:
                 torch.cuda.synchronize(dev)
             decode_elapsed_s = time.perf_counter() - t_decode_start
             elapsed_s = time.perf_counter() - t_start
-            del pkv, out
+            del pkv
         finally:
             hook.close()
 
