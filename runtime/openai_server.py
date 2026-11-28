@@ -803,10 +803,10 @@ class TensorMMUEngine:
             base_trunk = getattr(self.model, "model", None)
             lm_head_mod = getattr(self.model, "lm_head", None)
             if base_trunk is not None and lm_head_mod is not None:
-                # Run trunk in <=2048-token chunks and evaluate `lm_head` ONLY on the last token
-                # (`0.3 MB` instead of `5.2+ GiB` logits + bounded activation VRAM on 18K-64K agent prompts!)
+                # Run trunk in <=4096-token chunks (matches PREFILL_MAX_CHUNK_TOKENS -> 14x fewer cold-expert
+                # disk sweeps on 18K+ agent prompts!) and evaluate `lm_head` ONLY on the last token (`0.3 MB`).
                 seq_len_p = int(prompt_ids.shape[1])
-                prefill_chunk = 2048
+                prefill_chunk = 4096
                 if seq_len_p <= prefill_chunk:
                     base_out = base_trunk(input_ids=prompt_ids, attention_mask=p_mask, use_cache=True)
                     pkv = base_out.past_key_values
@@ -858,6 +858,13 @@ class TensorMMUEngine:
             if self.native_mtp is not None and use_greedy_spec and eff_draft_mode in ("two_tier", "mtp_only"):
                 self.native_mtp.prefill_from_hidden(prompt_ids, h_prefill)
             del h_prefill, ctx_tail
+            # Release oversized prefill scratch buffer (`~320 MiB` at 4096 chunk) before KV/graph binding
+            if dev.type == "cuda":
+                from runtime.moe_tlb_kernels import get_shared_moe_workspace
+
+                ws_p = get_shared_moe_workspace(dev)
+                if int(ws_p.prefill_out_f32.numel()) > 256 * 10 * 2048:
+                    ws_p.prefill_out_f32 = torch.empty((0,), dtype=torch.float32, device=dev)
 
             if torch.cuda.is_available() and dev.type == "cuda":
                 torch.cuda.synchronize(dev)
