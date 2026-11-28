@@ -72,6 +72,69 @@ _EFFORT_TO_BUDGET = {
     "xhigh": 20480,
 }
 
+_PREFIX_CACHE_MIN_TOKENS = 512
+_PREFIX_CACHE_MAX_ENTRIES = 4
+_PREFIX_CACHE_MAX_CPU_BYTES = 2 * (1024 ** 3)
+
+
+def _clone_cache_tree_to_device(obj: Any, target_dev: torch.device) -> Any:
+    """Recursively clones a HF `DynamicCache` (GQA KV + GatedDeltaNet conv/recurrent states) between GPU and CPU RAM."""
+    if obj is None or isinstance(obj, (bool, int, float, str, bytes, torch.dtype, torch.device)):
+        return obj
+    if isinstance(obj, torch.Tensor):
+        t = obj.detach()
+        return t.clone() if t.device == target_dev else t.to(device=target_dev, copy=True)
+    if isinstance(obj, list):
+        return [_clone_cache_tree_to_device(x, target_dev) for x in obj]
+    if isinstance(obj, tuple):
+        return tuple(_clone_cache_tree_to_device(x, target_dev) for x in obj)
+    if isinstance(obj, dict):
+        return {k: _clone_cache_tree_to_device(v, target_dev) for k, v in obj.items()}
+    if isinstance(obj, set):
+        return {_clone_cache_tree_to_device(x, target_dev) for x in obj}
+    if hasattr(obj, "__dict__") and not isinstance(obj, torch.nn.Module):
+        cls = type(obj)
+        out_obj = cls.__new__(cls)
+        out_obj.__dict__ = {
+            k: (v if k in ("config", "_config") else _clone_cache_tree_to_device(v, target_dev))
+            for k, v in obj.__dict__.items()
+        }
+        return out_obj
+    return obj
+
+
+def _estimate_cache_tree_bytes(obj: Any) -> int:
+    if isinstance(obj, torch.Tensor):
+        return int(obj.numel() * obj.element_size())
+    if isinstance(obj, (list, tuple, set)):
+        return sum(_estimate_cache_tree_bytes(x) for x in obj)
+    if isinstance(obj, dict):
+        return sum(_estimate_cache_tree_bytes(v) for v in obj.values())
+    if hasattr(obj, "__dict__") and not isinstance(obj, torch.nn.Module):
+        return sum(
+            0 if k in ("config", "_config") else _estimate_cache_tree_bytes(v)
+            for k, v in obj.__dict__.items()
+        )
+    return 0
+
+
+class _PrefixCacheEntry:
+    __slots__ = ("token_ids", "pkv_cpu", "h_tail_cpu", "mtp_kv_cpu", "nbytes")
+
+    def __init__(
+        self,
+        token_ids: List[int],
+        pkv_cpu: Any,
+        h_tail_cpu: torch.Tensor,
+        mtp_kv_cpu: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        nbytes: int,
+    ) -> None:
+        self.token_ids = token_ids
+        self.pkv_cpu = pkv_cpu
+        self.h_tail_cpu = h_tail_cpu
+        self.mtp_kv_cpu = mtp_kv_cpu
+        self.nbytes = int(nbytes)
+
 
 def _has_eagle_draft_head(nvm_dir: str) -> bool:
     return os.path.isfile(os.path.join(nvm_dir, "eagle_draft_head.safetensors")) and os.path.isfile(
@@ -272,6 +335,7 @@ class TensorMMUEngine:
         self.requests_served: int = 0
         self.total_emitted_tokens: int = 0
         self.last_request_telemetry: Optional[Dict[str, Any]] = None
+        self._prefix_cache_lru: List[_PrefixCacheEntry] = []
 
         # Async lifecycle state for Docker / Kubernetes startup (`initializing` -> `downloading` -> `compiling` -> `loading` -> `ready` | `failed`)
         self._state_lock = threading.Lock()
@@ -382,7 +446,55 @@ class TensorMMUEngine:
         except Exception:
             return False
 
+    def clear_prefix_cache(self) -> None:
+        self._prefix_cache_lru.clear()
+
+    def _find_best_prefix_entry(self, prompt_list: List[int]) -> Optional[_PrefixCacheEntry]:
+        """Finds the longest exact cached prefix `< len(prompt_list)` in CPU RAM (`0` VRAM) and promotes it to MRU."""
+        if os.environ.get("TMMU_DISABLE_PREFIX_CACHE", "").strip() == "1":
+            return None
+        max_p = len(prompt_list) - 1
+        if max_p < _PREFIX_CACHE_MIN_TOKENS or not self._prefix_cache_lru:
+            return None
+        best_idx = -1
+        best_len = 0
+        for idx, entry in enumerate(self._prefix_cache_lru):
+            elen = len(entry.token_ids)
+            if best_len < elen <= max_p and prompt_list[:elen] == entry.token_ids:
+                best_idx = idx
+                best_len = elen
+        if best_idx < 0:
+            return None
+        hit = self._prefix_cache_lru.pop(best_idx)
+        self._prefix_cache_lru.append(hit)
+        return hit
+
+    def _store_prefix_entry(
+        self,
+        token_ids: List[int],
+        pkv_cpu: Any,
+        h_tail_cpu: torch.Tensor,
+        mtp_kv_cpu: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> None:
+        if os.environ.get("TMMU_DISABLE_PREFIX_CACHE", "").strip() == "1":
+            return
+        if len(token_ids) < _PREFIX_CACHE_MIN_TOKENS:
+            return
+        # Replace existing entry of identical length/tokens if present
+        self._prefix_cache_lru = [
+            e for e in self._prefix_cache_lru if not (len(e.token_ids) == len(token_ids) and e.token_ids == token_ids)
+        ]
+        nb = _estimate_cache_tree_bytes(pkv_cpu) + _estimate_cache_tree_bytes(h_tail_cpu) + _estimate_cache_tree_bytes(mtp_kv_cpu)
+        entry = _PrefixCacheEntry(list(token_ids), pkv_cpu, h_tail_cpu, mtp_kv_cpu, nb)
+        self._prefix_cache_lru.append(entry)
+        while len(self._prefix_cache_lru) > _PREFIX_CACHE_MAX_ENTRIES or (
+            len(self._prefix_cache_lru) > 1
+            and sum(e.nbytes for e in self._prefix_cache_lru) > _PREFIX_CACHE_MAX_CPU_BYTES
+        ):
+            self._prefix_cache_lru.pop(0)
+
     def _unload_current(self) -> None:
+        self.clear_prefix_cache()
         if self.model is not None:
             self.save_warm_tlb_profile()
             runner = getattr(self.model, "_nvm_graph_runner", None)
@@ -642,6 +754,8 @@ class TensorMMUEngine:
             "l2_wina_ratio": l2_wina_ratio,
             "l2_wina_bits": l2_wina_bits,
             "cold_drop_weight": cold_drop_weight,
+            "prefix_cache_entries": len(self._prefix_cache_lru),
+            "prefix_cache_ram_mb": round(sum(e.nbytes for e in self._prefix_cache_lru) / (1024 ** 2), 1),
             "l2_ram_gb": l2_ram_gb,
             "all_experts_mapped": all_mapped,
             "cuda_graph_mode": graph_mode,
@@ -797,47 +911,86 @@ class TensorMMUEngine:
         hook = _LMHeadInputCaptureHook(self.model.lm_head)
         finish_reason = "length"
 
+        prompt_list = prompt_ids[0].tolist()
+        prefix_reused_tokens = 0
+
         try:
             t_start = time.perf_counter()
             p_mask = torch.ones_like(prompt_ids, dtype=torch.long, device=dev)
             base_trunk = getattr(self.model, "model", None)
             lm_head_mod = getattr(self.model, "lm_head", None)
+            prefill_cancelled = False
             if base_trunk is not None and lm_head_mod is not None:
-                # Run trunk in <=4096-token chunks (matches PREFILL_MAX_CHUNK_TOKENS -> 14x fewer cold-expert
-                # disk sweeps on 18K+ agent prompts!) and evaluate `lm_head` ONLY on the last token (`0.3 MB`).
                 seq_len_p = int(prompt_ids.shape[1])
                 prefill_chunk = 4096
-                if seq_len_p <= prefill_chunk:
-                    base_out = base_trunk(input_ids=prompt_ids, attention_mask=p_mask, use_cache=True)
-                    pkv = base_out.past_key_values
-                    h_prefill = base_out.last_hidden_state
-                    del base_out
-                else:
-                    pkv = None
-                    h_chunks: List[torch.Tensor] = []
-                    for p_start in range(0, seq_len_p, prefill_chunk):
-                        p_end = min(seq_len_p, p_start + prefill_chunk)
-                        c_out = base_trunk(
-                            input_ids=prompt_ids[:, p_start:p_end],
-                            attention_mask=p_mask[:, :p_end],
-                            past_key_values=pkv,
-                            use_cache=True,
-                        )
-                        pkv = c_out.past_key_values
-                        h_chunks.append(c_out.last_hidden_state)
-                        del c_out
-                    h_prefill = torch.cat(h_chunks, dim=1)
-                    del h_chunks
-                last_logits = lm_head_mod(h_prefill[:, -1:, :])[0, -1]
+                cpu_dev = torch.device("cpu")
+                hit_entry = self._find_best_prefix_entry(prompt_list)
+                start_offset = 0
+                pkv = None
+                h_prev_tail_gpu: Optional[torch.Tensor] = None
+                hit_mtp_kv_cpu: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+
+                if hit_entry is not None:
+                    start_offset = len(hit_entry.token_ids)
+                    prefix_reused_tokens = start_offset
+                    pkv = _clone_cache_tree_to_device(hit_entry.pkv_cpu, dev)
+                    h_prev_tail_gpu = hit_entry.h_tail_cpu.to(device=dev)
+                    hit_mtp_kv_cpu = hit_entry.mtp_kv_cpu
+
+                block_ckpt_pos = 0
+                if start_offset == 0 and seq_len_p >= prefill_chunk + 64:
+                    block_ckpt_pos = ((seq_len_p - 64) // prefill_chunk) * prefill_chunk
+                block_pkv_cpu: Any = None
+                block_h_tail_cpu: Optional[torch.Tensor] = None
+
+                h_chunks: List[torch.Tensor] = []
+                for p_start in range(start_offset, seq_len_p, prefill_chunk):
+                    if cancel_event is not None and cancel_event.is_set():
+                        prefill_cancelled = True
+                        break
+                    p_end = min(seq_len_p, p_start + prefill_chunk)
+                    c_out = base_trunk(
+                        input_ids=prompt_ids[:, p_start:p_end],
+                        attention_mask=p_mask[:, :p_end],
+                        past_key_values=pkv,
+                        use_cache=True,
+                    )
+                    pkv = c_out.past_key_values
+                    h_chunks.append(c_out.last_hidden_state)
+                    del c_out
+                    if block_ckpt_pos > 0 and p_end == block_ckpt_pos and pkv is not None:
+                        cur_h_last = h_chunks[-1][:, -min(8, int(h_chunks[-1].shape[1])) :, :]
+                        block_pkv_cpu = _clone_cache_tree_to_device(pkv, cpu_dev)
+                        block_h_tail_cpu = cur_h_last.detach().to(device=cpu_dev, copy=True)
+
+                if prefill_cancelled:
+                    del h_chunks, pkv
+                    stats_c = SpeculativeDecodeStats(
+                        generated_ids=[], emitted_tokens=0, forward_steps=0,
+                        draft_proposed=0, draft_accepted=0, pld_proposed=0, pld_accepted=0,
+                        eagle_proposed=0, eagle_accepted=0, elapsed_s=time.perf_counter() - t_start,
+                        ms_per_token=0.0, tok_per_s=0.0, tokens_per_step=1.0, acceptance_rate_pct=0.0,
+                        total_pcie_mb=0.0, pcie_mb_per_token=0.0, pcie_mb_per_step=0.0, tlb_hit_rate_pct=100.0,
+                    )
+                    return stats_c, "cancelled"
+
+                h_suffix = h_chunks[0] if len(h_chunks) == 1 else torch.cat(h_chunks, dim=1)
+                del h_chunks
+                last_logits = lm_head_mod(h_suffix[:, -1:, :])[0, -1]
             else:
+                start_offset = 0
+                h_prev_tail_gpu = None
+                hit_mtp_kv_cpu = None
+                block_ckpt_pos = 0
+                block_pkv_cpu = None
+                block_h_tail_cpu = None
                 out = self.model(input_ids=prompt_ids, attention_mask=p_mask, use_cache=True)
                 pkv = out.past_key_values
                 last_logits = out.logits[0, -1]
                 assert hook.last_hidden is not None
-                h_prefill = hook.last_hidden
+                h_suffix = hook.last_hidden
                 del out
 
-            prompt_list = prompt_ids[0].tolist()
             if use_greedy_spec:
                 first_tok = int(last_logits.argmax(dim=-1).item())
             else:
@@ -852,12 +1005,41 @@ class TensorMMUEngine:
                 )
             del last_logits
 
-            h_verified = h_prefill[:, -1:, :].clone()
-            ctx_tail = h_prefill[:, -min(8, int(h_prefill.shape[1])) :, :]
+            h_verified = h_suffix[:, -1:, :].clone()
+            if h_prev_tail_gpu is not None and int(h_suffix.shape[1]) < 8:
+                tail_cat = torch.cat([h_prev_tail_gpu, h_suffix], dim=1)
+                ctx_tail = tail_cat[:, -min(8, int(tail_cat.shape[1])) :, :].clone()
+                del tail_cat
+            else:
+                ctx_tail = h_suffix[:, -min(8, int(h_suffix.shape[1])) :, :].clone()
             c_ema = ctx_tail.mean(dim=1, keepdim=True).clone()
-            if self.native_mtp is not None and use_greedy_spec and eff_draft_mode in ("two_tier", "mtp_only"):
-                self.native_mtp.prefill_from_hidden(prompt_ids, h_prefill)
-            del h_prefill, ctx_tail
+
+            mtp_active = self.native_mtp is not None and use_greedy_spec and eff_draft_mode in ("two_tier", "mtp_only")
+            if mtp_active:
+                assert self.native_mtp is not None
+                if start_offset > 0 and h_prev_tail_gpu is not None:
+                    self.native_mtp.prefill_suffix_from_cpu_snapshot(
+                        kv_cpu_snap=hit_mtp_kv_cpu,
+                        full_input_ids=prompt_ids,
+                        h_prev_last_gpu=h_prev_tail_gpu[:, -1:, :],
+                        h_suffix_gpu=h_suffix,
+                        prefix_tok_len=start_offset,
+                    )
+                else:
+                    self.native_mtp.prefill_from_hidden(prompt_ids, h_suffix)
+
+            # Save 4K-aligned system-prefix checkpoint AND full-prompt checkpoint into 4-slot CPU RAM LRU (`0` GPU VRAM!)
+            if base_trunk is not None and pkv is not None and int(prompt_ids.shape[1]) >= _PREFIX_CACHE_MIN_TOKENS:
+                cpu_dev = torch.device("cpu")
+                if block_ckpt_pos >= _PREFIX_CACHE_MIN_TOKENS and block_pkv_cpu is not None and block_h_tail_cpu is not None:
+                    b_mtp = self.native_mtp.snapshot_kv_cpu(block_ckpt_pos - 1) if mtp_active and self.native_mtp is not None else None
+                    self._store_prefix_entry(prompt_list[:block_ckpt_pos], block_pkv_cpu, block_h_tail_cpu, b_mtp)
+                full_pkv_cpu = _clone_cache_tree_to_device(pkv, cpu_dev)
+                full_h_tail_cpu = ctx_tail.detach().to(device=cpu_dev, copy=True)
+                full_mtp_cpu = self.native_mtp.snapshot_kv_cpu() if mtp_active and self.native_mtp is not None else None
+                self._store_prefix_entry(prompt_list, full_pkv_cpu, full_h_tail_cpu, full_mtp_cpu)
+
+            del h_suffix, ctx_tail, h_prev_tail_gpu, block_pkv_cpu, block_h_tail_cpu
             # Release oversized prefill scratch buffer (`~320 MiB` at 4096 chunk) before KV/graph binding
             if dev.type == "cuda":
                 from runtime.moe_tlb_kernels import get_shared_moe_workspace
@@ -1299,10 +1481,17 @@ class TensorMMUEngine:
 
         self.requests_served += 1
         self.total_emitted_tokens += len(gen_ids)
-        self.last_request_telemetry = self._format_telemetry(stats, ttft_ms=ttft_ms)
+        self.last_request_telemetry = self._format_telemetry(
+            stats, ttft_ms=ttft_ms, prefix_reused_tokens=prefix_reused_tokens
+        )
         return stats, finish_reason
 
-    def _format_telemetry(self, stats: SpeculativeDecodeStats, ttft_ms: Optional[float] = None) -> Dict[str, Any]:
+    def _format_telemetry(
+        self,
+        stats: SpeculativeDecodeStats,
+        ttft_ms: Optional[float] = None,
+        prefix_reused_tokens: int = 0,
+    ) -> Dict[str, Any]:
         alloc_mb = float(torch.cuda.memory_allocated() / (1024 ** 2)) if torch.cuda.is_available() else 0.0
         out_tel: Dict[str, Any] = {
             "tok_per_s": round(stats.tok_per_s, 2),
@@ -1319,6 +1508,7 @@ class TensorMMUEngine:
             "tlb_slots": self.tlb_slots,
             "vm_mode": self.vm_mode,
             "draft_mode": self.draft_mode,
+            "prefix_reused_tokens": int(prefix_reused_tokens),
         }
         if ttft_ms is not None:
             out_tel["ttft_ms"] = round(ttft_ms, 1)
@@ -1946,7 +2136,11 @@ def create_openai_web_app(
 
             try:
                 while True:
-                    item = await tok_queue.get()
+                    try:
+                        item = await asyncio.wait_for(tok_queue.get(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        await resp.write(b": keepalive\n\n")
+                        continue
                     if item is None:
                         break
                     ans_toks: List[int] = []
@@ -2049,11 +2243,15 @@ def create_openai_web_app(
 
                 await resp.write(f"data: {json.dumps(fin_chunk)}\n\n".encode("utf-8"))
                 await resp.write(b"data: [DONE]\n\n")
-            except (ConnectionResetError, asyncio.CancelledError):
+            except (ConnectionError, OSError, asyncio.CancelledError):
                 cancel_ev.set()
                 await gen_fut
+                return resp
 
-        await resp.write_eof()
+        try:
+            await resp.write_eof()
+        except (ConnectionError, OSError, asyncio.CancelledError):
+            pass
         return resp
 
     # -----------------------------------------------------------------------
@@ -2246,7 +2444,11 @@ def create_openai_web_app(
 
             try:
                 while True:
-                    item = await tok_queue.get()
+                    try:
+                        item = await asyncio.wait_for(tok_queue.get(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        await resp.write(b": keepalive\n\n")
+                        continue
                     if item is None:
                         break
                     ans_toks: List[int] = []
@@ -2477,11 +2679,15 @@ def create_openai_web_app(
                     )
                 )
                 await resp.write(_format_sse_event("message_stop", {"type": "message_stop"}))
-            except (ConnectionResetError, asyncio.CancelledError):
+            except (ConnectionError, OSError, asyncio.CancelledError):
                 cancel_ev.set()
                 await gen_fut
+                return resp
 
-        await resp.write_eof()
+        try:
+            await resp.write_eof()
+        except (ConnectionError, OSError, asyncio.CancelledError):
+            pass
         return resp
 
     # -----------------------------------------------------------------------
@@ -2600,7 +2806,11 @@ def create_openai_web_app(
             gen_fut = loop.run_in_executor(None, _worker)
             try:
                 while True:
-                    item = await tok_queue.get()
+                    try:
+                        item = await asyncio.wait_for(tok_queue.get(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        await resp.write(b": keepalive\n\n")
+                        continue
                     if item is None:
                         break
                     delta_txt = inc_dec.push(item, final=False)
@@ -2623,11 +2833,15 @@ def create_openai_web_app(
                 }
                 await resp.write(f"data: {json.dumps(fin_chunk)}\n\n".encode("utf-8"))
                 await resp.write(b"data: [DONE]\n\n")
-            except (ConnectionResetError, asyncio.CancelledError):
+            except (ConnectionError, OSError, asyncio.CancelledError):
                 cancel_ev.set()
                 await gen_fut
+                return resp
 
-        await resp.write_eof()
+        try:
+            await resp.write_eof()
+        except (ConnectionError, OSError, asyncio.CancelledError):
+            pass
         return resp
 
     # UI & Docs

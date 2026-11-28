@@ -1466,11 +1466,12 @@ class SharedMoEWorkspace:
         if changed:
             self.version += 1
 
-    def ensure_prefill_capacity(self, chunk_tokens: int, top_k: int) -> None:
+    def ensure_prefill_capacity(self, chunk_tokens: int, top_k: int, extra_page_bytes: int = 0) -> None:
         need_out = int(chunk_tokens) * int(top_k) * int(self.max_d_model)
         if need_out > int(self.prefill_out_f32.numel()):
             self.prefill_out_f32 = torch.empty((need_out,), dtype=torch.float32, device=self.device)
-        need_stage = PREFILL_STAGE_SLOTS * int(self.max_page_bytes)
+        eff_pg = max(int(self.max_page_bytes), int(extra_page_bytes))
+        need_stage = PREFILL_STAGE_SLOTS * eff_pg
         if need_stage > int(self.prefill_page_stage.numel()):
             self.prefill_page_stage = torch.empty((need_stage,), dtype=torch.uint8, device=self.device)
 
@@ -1907,6 +1908,50 @@ class MoETLBLayerLauncher:
         )
         if (r1 | r2) != 0:
             raise RuntimeError(f"MoE wave kernel launch failed: r=({r1}, {r2})")
+
+    def launch_wina_wave_pairs(
+        self,
+        x_bf16: torch.Tensor,
+        wina_pages_ptr: int,
+        partial_f32_ptr: int,
+        slots_list: List[int],
+        tok_ids_list: List[int],
+        pair_ids_list: List[int],
+        weights_list: List[float],
+    ) -> None:
+        """Executes up to `128` `(slot, tok_id, pair_id, weight)` routes against VRAM-staged or Zero-Copy WINA pages (`k_keep = d_ffn`)."""
+        n_p = len(slots_list)
+        if n_p <= 0 or self.wina_layout is None:
+            return
+        assert self._kd is not None and n_p <= MAX_ACTIVE_UNIQUE
+        libcuda = self._kd["libcuda"]
+        stream_h = torch.cuda.current_stream(self.device)._as_parameter_
+        wl = self.wina_layout
+
+        self._ws.wina_l2_slots[:n_p].copy_(torch.tensor(slots_list, dtype=torch.int32))
+        self._ws.wina_l2_tok_ids[:n_p].copy_(torch.tensor(tok_ids_list, dtype=torch.int32))
+        self._ws.wina_l2_pair_ids[:n_p].copy_(torch.tensor(pair_ids_list, dtype=torch.int32))
+        self._ws.wina_l2_weights[:n_p].copy_(torch.tensor(weights_list, dtype=torch.float32))
+        self._ws.wina_num_l2.fill_(n_p)
+
+        self._x_ptr.value = x_bf16.data_ptr()
+        self._l2_wina_ptr.value = int(wina_pages_ptr)
+        self._partial_ptr.value = int(partial_f32_ptr)
+        self._wina_k_keep.value = wl.d_ffn
+
+        is_q3 = wl.bits == 3
+        gate_k_name = "moe_wina_gate_q3_kernel" if is_q3 else "moe_wina_gate_q4_kernel"
+        ud_k_name = "moe_wina_up_down_q3_kernel" if is_q3 else "moe_wina_up_down_q4_kernel"
+        rw0 = libcuda.cuLaunchKernel(
+            self._kd[gate_k_name].func,
+            self._grid_gu_x, n_p, 1, 128, 1, 1, 0, stream_h, self._args_wina_gate, None,
+        )
+        rw2 = libcuda.cuLaunchKernel(
+            self._kd[ud_k_name].func,
+            (wl.d_ffn + 3) // 4, n_p, 1, 128, 1, 1, 0, stream_h, self._args_wina_ud, None,
+        )
+        if (rw0 | rw2) != 0:
+            raise RuntimeError(f"MoE WINA prefill wave launch failed: r=({rw0}, {rw2})")
 
     def launch_zero_and_epilogue(
         self,

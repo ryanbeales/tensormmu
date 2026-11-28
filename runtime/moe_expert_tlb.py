@@ -1762,14 +1762,19 @@ class SparseMoETLBExperts(nn.Module):
         e2s = self.tlb_cache._expert_to_slot
         l2_home = self.tlb_cache._expert_l2_home
         l2_dev_ptr = self.tlb_cache.l2_zero_copy_dev_ptr
-        has_l2 = l2_dev_ptr != 0
+        l2_wina_ptr = self.tlb_cache.l2_wina_dev_ptr
+        l2_wina_pages = self.tlb_cache.l2_wina_pinned_pages
+        wina_lay = self.tlb_cache.wina_layout
+        has_l2_u4 = l2_dev_ptr != 0
+        has_l2_wina = l2_wina_ptr != 0 and l2_wina_pages is not None and wina_lay is not None
         n_exp = self.num_experts
         page_bytes = self.layout.page_bytes
+        extra_wina_bytes = wina_lay.page_bytes if has_l2_wina and wina_lay is not None else 0
 
         for c_start in range(0, T_total, PREFILL_MAX_CHUNK_TOKENS):
             c_end = min(T_total, c_start + PREFILL_MAX_CHUNK_TOKENS)
             T_c = c_end - c_start
-            ws.ensure_prefill_capacity(T_c, K)
+            ws.ensure_prefill_capacity(T_c, K, extra_page_bytes=extra_wina_bytes)
             partial_ptr = ws.prefill_out_f32.data_ptr()
 
             # 1. Zero `partial_f32` on GPU while CPU groups routes in ~20 microseconds
@@ -1783,6 +1788,8 @@ class SparseMoETLBExperts(nn.Module):
             s_w_list: List[float] = w_flat[order].tolist()
 
             mapped_items: List[Tuple[int, List[int], List[int], List[float]]] = []
+            wina_zc_pairs: List[Tuple[int, int, int, float]] = []
+            wina_stage_groups: List[Tuple[int, List[Tuple[int, int, float]]]] = []
             cold_groups: List[Tuple[int, List[Tuple[int, int, float]]]] = []
 
             n_pairs = len(s_exp_list)
@@ -1800,29 +1807,48 @@ class SparseMoETLBExperts(nn.Module):
                         self.tlb_cache._page_hits += 1
                         self.tlb_cache._access_clock += 1
                         self.tlb_cache._slot_last_used[l1_slot] = self.tlb_cache._access_clock
-                        enc_slot = l1_slot
-                    elif has_l2 and l2_home[e_id] >= 0:
-                        self.tlb_cache._l2_zero_copy_hits += 1
-                        self.tlb_cache._pcie_bytes += page_bytes
-                        self.tlb_cache._distinct_pages.add(e_id)
-                        # If `n_tok_e <= 8` (`1` work-item), read directly from L2 Zero-Copy with zero staging!
-                        # If `n_tok_e > 8` (`2+` split work-items), stage once into VRAM so PCIe is read once!
-                        enc_slot = (-2 - l2_home[e_id]) if n_tok_e <= MAX_FUSED_DECODE_TOKENS else -1
-                    else:
-                        self.tlb_cache._page_misses += 1
-                        self.tlb_cache._demand_misses += 1
-                        self.tlb_cache._pcie_bytes += page_bytes
-                        self.tlb_cache._distinct_pages.add(e_id)
-                        enc_slot = -1
-
-                    if enc_slot != -1:
                         for sub in range(pos, end_p, MAX_FUSED_DECODE_TOKENS):
                             sub_end = min(end_p, sub + MAX_FUSED_DECODE_TOKENS)
                             t_ids = [s_pair_list[j] // K for j in range(sub, sub_end)]
                             p_ids = [s_pair_list[j] for j in range(sub, sub_end)]
                             ws_sub = [s_w_list[j] for j in range(sub, sub_end)]
-                            mapped_items.append((enc_slot, t_ids, p_ids, ws_sub))
+                            mapped_items.append((l1_slot, t_ids, p_ids, ws_sub))
+                    elif has_l2_wina and l2_home[e_id] >= 0:
+                        assert wina_lay is not None
+                        l2_idx = l2_home[e_id]
+                        self.tlb_cache._l2_zero_copy_hits += 1
+                        self.tlb_cache._pcie_bytes += wina_lay.page_bytes
+                        self.tlb_cache._distinct_pages.add(e_id)
+                        if n_tok_e <= 2:
+                            for j in range(pos, end_p):
+                                wina_zc_pairs.append((l2_idx, s_pair_list[j] // K, s_pair_list[j], s_w_list[j]))
+                        else:
+                            pairs_for_e = [
+                                (s_pair_list[j] // K, s_pair_list[j], s_w_list[j]) for j in range(pos, end_p)
+                            ]
+                            wina_stage_groups.append((l2_idx, pairs_for_e))
+                    elif has_l2_u4 and l2_home[e_id] >= 0:
+                        self.tlb_cache._l2_zero_copy_hits += 1
+                        self.tlb_cache._pcie_bytes += page_bytes
+                        self.tlb_cache._distinct_pages.add(e_id)
+                        if n_tok_e <= MAX_FUSED_DECODE_TOKENS:
+                            enc_slot = -2 - l2_home[e_id]
+                            for sub in range(pos, end_p, MAX_FUSED_DECODE_TOKENS):
+                                sub_end = min(end_p, sub + MAX_FUSED_DECODE_TOKENS)
+                                t_ids = [s_pair_list[j] // K for j in range(sub, sub_end)]
+                                p_ids = [s_pair_list[j] for j in range(sub, sub_end)]
+                                ws_sub = [s_w_list[j] for j in range(sub, sub_end)]
+                                mapped_items.append((enc_slot, t_ids, p_ids, ws_sub))
+                        else:
+                            pairs_for_e = [
+                                (s_pair_list[j] // K, s_pair_list[j], s_w_list[j]) for j in range(pos, end_p)
+                            ]
+                            cold_groups.append((e_id, pairs_for_e))
                     else:
+                        self.tlb_cache._page_misses += 1
+                        self.tlb_cache._demand_misses += 1
+                        self.tlb_cache._pcie_bytes += page_bytes
+                        self.tlb_cache._distinct_pages.add(e_id)
                         pairs_for_e = [
                             (s_pair_list[j] // K, s_pair_list[j], s_w_list[j]) for j in range(pos, end_p)
                         ]
@@ -1832,7 +1858,7 @@ class SparseMoETLBExperts(nn.Module):
             x_chunk = x_bf16[c_start:c_end]
             out_chunk = out_bf16[c_start:c_end]
 
-            # 2. Execute all L1 VRAM + single-item L2 Zero-Copy mapped experts with ZERO staging copies!
+            # 2. Execute all L1 VRAM + single-item UINT4 L2 Zero-Copy mapped experts with ZERO staging copies!
             if mapped_items:
                 self._run_packed_wave_list(
                     x_chunk_bf16=x_chunk,
@@ -1842,7 +1868,43 @@ class SparseMoETLBExperts(nn.Module):
                     items=mapped_items,
                 )
 
-            # 3. Stream cold L3 `nvme_mmap` (or multi-chunk L2) experts in 32-expert (~56 MB) pinned burst DMA waves!
+            # 2b. Execute L2 `UINT3/4-WINA` experts directly from pinned DDR5 (`22.9 GB/s` H2D, ZERO `nvme_mmap` disk I/O!)
+            if wina_zc_pairs:
+                for p_st in range(0, len(wina_zc_pairs), MAX_ACTIVE_UNIQUE):
+                    sub_p = wina_zc_pairs[p_st : p_st + MAX_ACTIVE_UNIQUE]
+                    self._cuda_launcher.launch_wina_wave_pairs(
+                        x_bf16=x_chunk,
+                        wina_pages_ptr=l2_wina_ptr,
+                        partial_f32_ptr=partial_ptr,
+                        slots_list=[p[0] for p in sub_p],
+                        tok_ids_list=[p[1] for p in sub_p],
+                        pair_ids_list=[p[2] for p in sub_p],
+                        weights_list=[p[3] for p in sub_p],
+                    )
+            if wina_stage_groups:
+                assert l2_wina_pages is not None and wina_lay is not None
+                w_pg_b = wina_lay.page_bytes
+                stage_wina_2d = ws.prefill_page_stage[: PREFILL_STAGE_SLOTS * w_pg_b].view(PREFILL_STAGE_SLOTS, w_pg_b)
+                for b_idx in range(0, len(wina_stage_groups), PREFILL_STAGE_SLOTS):
+                    batch_w = wina_stage_groups[b_idx : b_idx + PREFILL_STAGE_SLOTS]
+                    wave_pairs: List[Tuple[int, int, int, float]] = []
+                    for local_slot, (l2_idx, pairs_for_e) in enumerate(batch_w):
+                        stage_wina_2d[local_slot].copy_(l2_wina_pages[l2_idx], non_blocking=True)
+                        for t_id, p_id, wt in pairs_for_e:
+                            wave_pairs.append((local_slot, t_id, p_id, wt))
+                    for p_st in range(0, len(wave_pairs), MAX_ACTIVE_UNIQUE):
+                        sub_p = wave_pairs[p_st : p_st + MAX_ACTIVE_UNIQUE]
+                        self._cuda_launcher.launch_wina_wave_pairs(
+                            x_bf16=x_chunk,
+                            wina_pages_ptr=stage_wina_2d.data_ptr(),
+                            partial_f32_ptr=partial_ptr,
+                            slots_list=[p[0] for p in sub_p],
+                            tok_ids_list=[p[1] for p in sub_p],
+                            pair_ids_list=[p[2] for p in sub_p],
+                            weights_list=[p[3] for p in sub_p],
+                        )
+
+            # 3. Stream remaining truly cold L3 `nvme_mmap` experts in 32-expert (~54 MB) pinned burst DMA waves!
             if cold_groups:
                 comp_stream = torch.cuda.current_stream(flat_x.device)
                 stage_gpu_2d = ws.prefill_page_stage[: PREFILL_STAGE_SLOTS * page_bytes].view(
@@ -1854,7 +1916,7 @@ class SparseMoETLBExperts(nn.Module):
                     cold_items: List[Tuple[int, List[int], List[int], List[float]]] = []
                     staged_h2d: List[Tuple[int, torch.Tensor, int]] = []
                     for local_slot, (e_id, pairs_for_e) in enumerate(batch):
-                        l2_idx = l2_home[e_id] if has_l2 else -1
+                        l2_idx = l2_home[e_id] if has_l2_u4 else -1
                         if l2_idx >= 0 and l2_pages is not None:
                             staged_h2d.append((local_slot, l2_pages[l2_idx], -1))
                         else:

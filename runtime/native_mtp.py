@@ -348,6 +348,84 @@ class NativeMTPModule(nn.Module):
         self.cur_seq_len = n_pref
 
     @torch.no_grad()
+    def snapshot_kv_cpu(self, upto_entries: Optional[int] = None) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Copies MTP's `[0 .. n)` KV cache entries to pageable CPU RAM (`0` GPU VRAM) for prefix caching."""
+        if self.k_buf is None or self.v_buf is None:
+            return None
+        n = self.cur_seq_len if upto_entries is None else min(int(upto_entries), self.cur_seq_len)
+        if n <= 0:
+            return (
+                torch.empty((1, self.num_kv_heads, 0, self.head_dim), dtype=self.dtype, device="cpu"),
+                torch.empty((1, self.num_kv_heads, 0, self.head_dim), dtype=self.dtype, device="cpu"),
+            )
+        return (
+            self.k_buf[:, :, :n, :].detach().to(device="cpu"),
+            self.v_buf[:, :, :n, :].detach().to(device="cpu"),
+        )
+
+    @torch.no_grad()
+    def prefill_suffix_from_cpu_snapshot(
+        self,
+        kv_cpu_snap: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        full_input_ids: torch.Tensor,     # [1, L]
+        h_prev_last_gpu: torch.Tensor,    # [1, 1, D] hidden state at `prefix_tok_len - 1`
+        h_suffix_gpu: torch.Tensor,       # [1, L - prefix_tok_len, D] hidden states for `prefix_tok_len .. L - 1`
+        prefix_tok_len: int,
+    ) -> None:
+        """Restores MTP KV for `0 .. prefix_tok_len - 2` and prefills only the `L - prefix_tok_len` suffix tokens (`0.0-ulp`)."""
+        L = int(full_input_ids.shape[1])
+        P = int(prefix_tok_len)
+        self.ensure_kv_capacity(L + 256)
+        assert self.k_buf is not None and self.v_buf is not None
+        base_idx = max(0, P - 1)
+        if kv_cpu_snap is not None and base_idx > 0:
+            k_cpu, v_cpu = kv_cpu_snap
+            copy_n = min(base_idx, int(k_cpu.shape[2]))
+            if copy_n > 0:
+                self.k_buf[:, :, :copy_n, :].copy_(k_cpu[:, :, :copy_n, :], non_blocking=True)
+                self.v_buf[:, :, :copy_n, :].copy_(v_cpu[:, :, :copy_n, :], non_blocking=True)
+
+        n_suf = L - P
+        if n_suf <= 0:
+            self.cur_seq_len = max(0, L - 1)
+            return
+
+        new_ids = full_input_ids[:, P:]
+        if n_suf == 1:
+            new_h_shift = h_prev_last_gpu
+        else:
+            new_h_shift = torch.cat([h_prev_last_gpu, h_suffix_gpu[:, :-1, :]], dim=1)
+
+        lyr = self.layer
+        sa = lyr.self_attn
+        rot = self._get_rotary_emb()
+        embed_fn = self._get_embed_tokens()
+
+        chunk_sz = 2048
+        for s_off in range(0, n_suf, chunk_sz):
+            e_off = min(n_suf, s_off + chunk_sz)
+            c_len = e_off - s_off
+            emb_shift = embed_fn(new_ids[:, s_off:e_off])
+            h_shift = new_h_shift[:, s_off:e_off, :]
+            fused = self.fc(torch.cat([self.pre_fc_norm_embedding(emb_shift), self.pre_fc_norm_hidden(h_shift)], dim=-1))
+            normed = lyr.input_layernorm(fused)
+            k_states = sa.k_proj(normed).view(1, c_len, self.num_kv_heads, self.head_dim)
+            v_states = sa.v_proj(normed).view(1, c_len, self.num_kv_heads, self.head_dim)
+            if hasattr(sa, "k_norm") and sa.k_norm is not None:
+                k_states = sa.k_norm(k_states)
+            k_states = k_states.transpose(1, 2)
+            v_states = v_states.transpose(1, 2)
+            abs_s = base_idx + s_off
+            abs_e = base_idx + e_off
+            if rot is not None:
+                pos_ids = torch.arange(abs_s, abs_e, device=self.device, dtype=torch.long).unsqueeze(0)
+                cos, sin = rot(v_states, pos_ids)
+                _, k_states = _apply_rotary_pos_emb_static(k_states, k_states, cos, sin)
+            self.k_buf[:, :, abs_s:abs_e, :].copy_(k_states)
+            self.v_buf[:, :, abs_s:abs_e, :].copy_(v_states)
+        self.cur_seq_len = L - 1
+
+    @torch.no_grad()
     def _ensure_cuda_graph(self) -> bool:
         if not torch.cuda.is_available() or self.device.type != "cuda":
             return False
